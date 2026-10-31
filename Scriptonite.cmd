@@ -110,7 +110,7 @@ function Save-ScriptoniteScriptBytes {
     }
     $null = New-Item -ItemType Directory -Path $CacheDirectory -Force
     # Separate immutable file for every run: an open monitor is never overwritten.
-    $filename = 'network-monitor-{0}.ps1' -f [Guid]::NewGuid().ToString('N')
+    $filename = 'script-{0}.ps1' -f [Guid]::NewGuid().ToString('N')
     $target = Join-Path $CacheDirectory $filename
     [IO.File]::WriteAllText($target, $text, (New-Object Text.UTF8Encoding($true)))
     return $target
@@ -142,33 +142,38 @@ if (-not (Test-ScriptoniteAdministrator)) {
     return
 }
 
-$monitorUrl = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/network-monitor.ps1'
+$catalog = [ordered]@{
+    '1' = @{ Name = 'Монитор сети'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/network-monitor.ps1' }
+    '2' = @{ Name = 'Монитор USB'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/usb-monitor.ps1' }
+}
 $cacheDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Scriptonite\scripts'
 $status = ''
 
 while ($true) {
     Show-ScriptoniteHeader
-    Write-Host '[1] Монитор сети' -ForegroundColor White
+    foreach ($number in $catalog.Keys) {
+        Write-Host "[$number] $($catalog[$number].Name)" -ForegroundColor White
+    }
     Write-Host '[0] Выход' -ForegroundColor DarkGray
     Write-Host ''
     Write-Host 'Монитор открывается в отдельном PowerShell от администратора.' -ForegroundColor DarkGray
     if ($status) { Write-Host $status -ForegroundColor Cyan }
     Write-Host ''
-    $choice = Read-Host 'Выберите скрипт'
-    switch ($choice.Trim()) {
-        '0' { return }
-        '1' {
-            try {
-                Write-Host 'Скачиваю актуальный монитор с GitHub...' -ForegroundColor Cyan
-                $monitorPath = Save-ScriptoniteDownload -Uri $monitorUrl -CacheDirectory $cacheDirectory
-                Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath
-                $status = 'Монитор запущен в отдельном окне. Меню готово к работе.'
-            } catch {
-                Write-Host "Не удалось запустить монитор: $($_.Exception.Message)" -ForegroundColor Red
-                $status = 'Монитор не запущен. Можно повторить выбор [1].'
-                $null = Read-Host 'Нажмите Enter для возврата в меню'
-            }
-        }
-        default { $status = 'Введите 1 для запуска монитора или 0 для выхода.' }
+    $choice = ([string](Read-Host 'Выберите скрипт')).Trim()
+    if ($choice -eq '0') { return }
+    if (-not $catalog.Contains($choice)) {
+        $status = 'Введите 1 — сеть, 2 — USB или 0 — выход.'
+        continue
+    }
+    $selected = $catalog[$choice]
+    try {
+        Write-Host "Скачиваю с GitHub: $($selected.Name)..." -ForegroundColor Cyan
+        $monitorPath = Save-ScriptoniteDownload -Uri $selected.Uri -CacheDirectory $cacheDirectory
+        Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath
+        $status = "$($selected.Name) запущен в отдельном окне. Меню готово к работе."
+    } catch {
+        Write-Host "Не удалось запустить $($selected.Name): $($_.Exception.Message)" -ForegroundColor Red
+        $status = "Скрипт не запущен. Можно повторить выбор [$choice]."
+        $null = Read-Host 'Нажмите Enter для возврата в меню'
     }
 }
