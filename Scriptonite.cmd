@@ -10,7 +10,7 @@ if errorlevel 1 (
 exit /b
 #==SCRIPTONITE_PS1==#
 [CmdletBinding()]
-param()
+param([string]$ReportDirectory)
 
 $ErrorActionPreference = 'Stop'
 
@@ -42,11 +42,12 @@ function Test-ScriptoniteAdministrator {
 }
 
 function Start-ScriptoniteElevated {
-    param([string]$ScriptPath, [string]$PowerShellPath)
+    param([string]$ScriptPath, [string]$PowerShellPath, [string]$ReportDirectory)
 
     # EncodedCommand safely carries paths containing spaces or apostrophes.
     $escapedPath = $ScriptPath.Replace("'", "''")
     $command = "& '$escapedPath'"
+    if($ReportDirectory){$command += " -ReportDirectory '$($ReportDirectory.Replace("'", "''"))'"}
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     try {
         Start-Process -FilePath $PowerShellPath -Verb RunAs -WindowStyle Normal -ErrorAction Stop -ArgumentList @(
@@ -117,16 +118,28 @@ function Save-ScriptoniteScriptBytes {
 }
 
 function Start-ScriptoniteMonitor {
-    param([string]$ScriptPath, [string]$PowerShellPath)
+    param([string]$ScriptPath, [string]$PowerShellPath, [string]$OutputDirectory)
 
     # Native ArgumentList is joined into one string; quote the path explicitly.
     $arguments = '-NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -File "{0}"' -f $ScriptPath
+    if($OutputDirectory){
+        $quotedDirectory=$OutputDirectory -replace '(\\+)$', '$1$1'
+        $arguments += ' -OutputDirectory "{0}"' -f $quotedDirectory
+    }
     # The launcher is already elevated; the new visible PowerShell inherits its token.
     Start-Process -FilePath $PowerShellPath -ArgumentList $arguments -WindowStyle Normal -ErrorAction Stop | Out-Null
 }
 
 $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if (-not (Test-Path -LiteralPath $powerShellPath)) { throw 'Windows PowerShell не найден.' }
+if(-not $ReportDirectory){
+    if($env:SCRIPTONITE_SOURCE -and (Test-Path -LiteralPath $env:SCRIPTONITE_SOURCE)){
+        $ReportDirectory=[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($env:SCRIPTONITE_SOURCE))
+    }elseif($PSScriptRoot -and $PSScriptRoot -notlike '*\Scriptonite\launcher\*'){
+        $ReportDirectory=$PSScriptRoot
+    }else{$ReportDirectory=[Environment]::GetFolderPath('Desktop')}
+}
+$ReportDirectory=[IO.Path]::GetFullPath($ReportDirectory)
 
 Show-ScriptoniteHeader
 if (-not (Test-ScriptoniteAdministrator)) {
@@ -136,7 +149,7 @@ if (-not (Test-ScriptoniteAdministrator)) {
         $null = Read-Host 'Нажмите Enter для выхода'
         return
     }
-    if (-not (Start-ScriptoniteElevated -ScriptPath $PSCommandPath -PowerShellPath $powerShellPath)) {
+    if (-not (Start-ScriptoniteElevated -ScriptPath $PSCommandPath -PowerShellPath $powerShellPath -ReportDirectory $ReportDirectory)) {
         $null = Read-Host 'Нажмите Enter для выхода'
     }
     return
@@ -146,6 +159,7 @@ $catalog = [ordered]@{
     '1' = @{ Name = 'Монитор сети'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/network-monitor.ps1' }
     '2' = @{ Name = 'Монитор USB'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/usb-monitor.ps1' }
     '3' = @{ Name = 'Монитор принтеров'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/printer-monitor.ps1' }
+    '4' = @{ Name = 'Сниффер принтера'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/printer-sniffer.ps1'; Report=$true }
 }
 $cacheDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Scriptonite\scripts'
 $status = ''
@@ -163,14 +177,15 @@ while ($true) {
     $choice = ([string](Read-Host 'Выберите скрипт')).Trim()
     if ($choice -eq '0') { return }
     if (-not $catalog.Contains($choice)) {
-        $status = 'Введите 1 — сеть, 2 — USB, 3 — принтеры или 0 — выход.'
+        $status = 'Введите 1 — сеть, 2 — USB, 3 — принтеры, 4 — сниффер или 0 — выход.'
         continue
     }
     $selected = $catalog[$choice]
     try {
         Write-Host "Скачиваю с GitHub: $($selected.Name)..." -ForegroundColor Cyan
         $monitorPath = Save-ScriptoniteDownload -Uri $selected.Uri -CacheDirectory $cacheDirectory
-        Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath
+        if($selected.Report){Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath -OutputDirectory $ReportDirectory}
+        else{Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath}
         $status = "$($selected.Name) запущен в отдельном окне. Меню готово к работе."
     } catch {
         Write-Host "Не удалось запустить $($selected.Name): $($_.Exception.Message)" -ForegroundColor Red
