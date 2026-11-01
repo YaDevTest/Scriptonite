@@ -145,6 +145,7 @@ if (-not (Test-ScriptoniteAdministrator)) {
 $catalog = [ordered]@{
     '1' = @{ Name = 'Монитор сети'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/network-monitor.ps1' }
     '2' = @{ Name = 'Монитор USB'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/usb-monitor.ps1' }
+    '3' = @{ Name = 'Монитор принтеров'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/printer-monitor.ps1' }
 }
 $cacheDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Scriptonite\scripts'
 $status = ''
@@ -162,7 +163,7 @@ while ($true) {
     $choice = ([string](Read-Host 'Выберите скрипт')).Trim()
     if ($choice -eq '0') { return }
     if (-not $catalog.Contains($choice)) {
-        $status = 'Введите 1 — сеть, 2 — USB или 0 — выход.'
+        $status = 'Введите 1 — сеть, 2 — USB, 3 — принтеры или 0 — выход.'
         continue
     }
     $selected = $catalog[$choice]
