@@ -76,7 +76,9 @@ function Get-SnifferJobObservations {
         $flags = [uint32]$job.JobStatus
         $status = Get-SnifferJobStatus $flags
         $document = ([string]$job.DocumentName) -replace '[\x00-\x1F\x7F]', ' '
-        $tag = "#$($job.ID) $document"
+        if(-not $document){$document='Имя документа недоступно'}
+        $sizeText=if($null -ne $job.Size){[string]$job.Size+' байт'}else{'размер недоступен'}
+        $tag = "#$($job.ID) «$document» | $sizeText | поступило: $stamp"
         if (-not $State.Records.ContainsKey($key)) {
             $State.Records[$key] = [PSCustomObject]@{ Flags=$flags; Active=$true; Printed=$status.Printed; HadError=$status.Error; Tag=$tag }
             $code = if ($Baseline) { 'JOB_EXISTING' } else { 'JOB_NEW' }
@@ -194,7 +196,11 @@ try {
                     $printer=$printed.SelectSingleNode("*[local-name()='Param5']")
                     if(-not $printer -or $printer.InnerText -ne $Name){continue}
                     $id=$printed.SelectSingleNode("*[local-name()='Param1']")
-                    Send-Notice WINDOWS_COMPLETED "Windows зарегистрировала завершение задания #$($id.InnerText) (событие 307). Фактический выход чека не подтверждён." Green
+                    $document=$printed.SelectSingleNode("*[local-name()='Param2']")
+                    $documentName=if($document){$document.InnerText -replace '[\x00-\x1F\x7F]',' '}else{'Имя документа недоступно'}
+                    $size=$printed.SelectSingleNode("*[local-name()='Param7']")
+                    $sizeText=if($size){$size.InnerText+' байт'}else{'размер недоступен'}
+                    Send-Notice WINDOWS_COMPLETED "Windows зарегистрировала завершение задания #$($id.InnerText) «$documentName» | $sizeText (событие 307). Фактический выход чека не подтверждён." Green
                 }
             }catch{}
         }
@@ -235,7 +241,7 @@ function Receive-SnifferPrintMessages {
     if (-not $Watcher) { return }
     if($Watcher.PowerShell -and $Watcher.PowerShell.InvocationStateInfo.State -eq 'Failed' -and -not $State.WatchFailed) {
         $State.WatchFailed=$true
-        $Watcher.Queue.Enqueue([PSCustomObject]@{Code='WATCH_ERROR';Text='Фоновое наблюдение за очередью завершилось с ошибкой. Пакеты продолжают записываться.';Color='Red';Count=0})
+        $Watcher.Queue.Enqueue([PSCustomObject]@{Code='WATCH_ERROR';Text='Фоновое наблюдение за очередью завершилось с ошибкой. Сведения о заданиях после ошибки могут быть неполными.';Color='Red';Count=0})
     }
     $message=$null
     while($Watcher.Queue.TryDequeue([ref]$message)) {
@@ -251,11 +257,19 @@ function Receive-SnifferPrintMessages {
         }
         if($message.Code -in @('JOB_STATE','JOB_NEW','JOB_EXISTING','JOB_LEFT','WINDOWS_PRINTED','WINDOWS_COMPLETED')){$State.LastJob=[string]$message.Text}
         if($message.Text) {
-            $line="$([DateTime]::UtcNow.ToString('o')) [ПЕЧАТЬ/$($message.Code)] $($message.Text)"
-            $Writer.WriteLine($line)
-            Write-Host $message.Text -ForegroundColor $message.Color
+            Write-SnifferEvidenceEvent $Writer $State $message.Code $message.Text $message.Color
         }
         $message=$null
+    }
+}
+
+function Write-SnifferEvidenceEvent {
+    param([IO.TextWriter]$Writer,[hashtable]$State,[string]$Code,[string]$Text,[string]$Color='Yellow')
+    $line="$([DateTime]::UtcNow.ToString('o')) [ПЕЧАТЬ/$Code] [Принтер: $($State.PrinterName)] $Text"
+    $Writer.WriteLine($line)
+    Write-Host $Text -ForegroundColor $Color
+    if($State.ContainsKey('Evidence') -and $Code -ne 'INFO'){
+        if($State.Evidence.Count -lt 10000){$State.Evidence.Add($line)}else{$State.EvidenceTruncated=$true}
     }
 }
 
@@ -264,10 +278,18 @@ function Write-SnifferPrintSummary {
     $Writer.WriteLine("`r`n================ НАБЛЮДЕНИЕ ЗА ПЕЧАТЬЮ ================")
     $Writer.WriteLine('Задания Windows: '+$(if($State.SawJobs){'замечены'}else{'не замечены; это не доказывает отсутствие печати'}))
     $Writer.WriteLine("Заданий с идентификаторами замечено: $($State.JobsSeen); уведомлений о поступлении: $($State.Arrivals). Эти числа могут относиться к одним и тем же заданиям и не суммируются.")
-    $Writer.WriteLine("Данных на настроенный TCP-порт печати замечено: $($State.PrintBytes) байт (с возможными повторами пакетов).")
+    if($State.ContainsKey('NetworkCapture') -and -not $State.NetworkCapture){
+        $Writer.WriteLine('Режим очереди Windows (в том числе USB): подтверждается поступление/состояние задания, а не физическая передача USB-байтов.')
+    }else{$Writer.WriteLine("Данных на настроенный TCP-порт печати замечено: $($State.PrintBytes) байт (с возможными повторами пакетов).")}
     $Writer.WriteLine('Завершение по данным Windows: '+$(if($State.WindowsReported){'есть сообщение Windows; бумага не подтверждена'}else{'не подтверждено'}))
     $Writer.WriteLine("Сообщений об ошибках задания: $($State.Errors); TCP RST на канале печати: $($State.Resets). RST сам по себе не доказывает сбой задания.")
     if($State.LastJob){$Writer.WriteLine('Последнее наблюдение: '+$State.LastJob)}
+    if($State.ContainsKey('Evidence')){
+        $Writer.WriteLine("`r`n================ ХРОНОЛОГИЯ ЗАДАНИЙ И ОТПРАВКИ ================")
+        foreach($line in $State.Evidence){$Writer.WriteLine($line)}
+        if(-not $State.Evidence.Count){$Writer.WriteLine('Событий отправки не замечено. Это не является доказательством отсутствия печати.')}
+        if($State.EvidenceTruncated){$Writer.WriteLine('Здесь первые 10000 событий. Остальные ищите в основной хронологии отчёта выше.')}
+    }
 }
 
 function Get-SnifferTargets {
@@ -276,16 +298,23 @@ function Get-SnifferTargets {
     try {
         foreach ($printer in @(Get-Printer -Full -ErrorAction Stop | Sort-Object Name)) {
             $port = $ports[$printer.PortName]
-            if (-not $port -or -not $port.PrinterHostAddress) { continue }
+            $networkFound=$false
+            if (-not $port -or -not $port.PrinterHostAddress) {
+                $type=if($printer.PortName -match '^USB[0-9]+'){ 'USB' }elseif($printer.PortName -like 'WSD*'){ 'WSD / очередь Windows' }else{'Очередь Windows'}
+                [PSCustomObject]@{Name=$printer.Name;IP='';Port=$printer.PortName;CapturePort=0;CaptureNetwork=$false;ConnectionType=$type}
+                continue
+            }
             $address = [string]$port.PrinterHostAddress
             try {
                 $ip = $null
                 $addresses = if ([Net.IPAddress]::TryParse($address, [ref]$ip)) { @($ip) } else { @([Net.Dns]::GetHostAddresses($address)) }
                 foreach ($ipv4 in @($addresses | Where-Object { $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork })) {
                     if ([Net.IPAddress]::IsLoopback($ipv4) -or $ipv4.Equals([Net.IPAddress]::Any) -or $ipv4.GetAddressBytes()[0] -ge 224) { continue }
-                    [PSCustomObject]@{ Name=$printer.Name; IP=$ipv4.ToString(); Port=$printer.PortName; CapturePort=$port.PortNumber }
+                    $networkFound=$true
+                    [PSCustomObject]@{ Name=$printer.Name; IP=$ipv4.ToString(); Port=$printer.PortName; CapturePort=$port.PortNumber; CaptureNetwork=$true; ConnectionType='LAN' }
                 }
             } catch { Write-Host "Не удалось определить адрес [$($printer.Name)]: $address" -ForegroundColor DarkYellow }
+            if(-not $networkFound){[PSCustomObject]@{Name=$printer.Name;IP='';Port=$printer.PortName;CapturePort=0;CaptureNetwork=$false;ConnectionType='Очередь Windows; IPv4 не определён'}}
         }
     } catch { Write-Host 'Список принтеров недоступен. Можно ввести IPv4 вручную.' -ForegroundColor Yellow }
 }
@@ -513,8 +542,11 @@ function Test-PrinterSnifferStop {
 
 function Start-PrinterSnifferSession {
     param($Target, [string]$Directory, [int]$LimitMegabytes)
-    $localAddress = Get-SnifferLocalAddress $Target.IP
-    $selfTarget = $localAddress -eq $Target.IP
+    $networkCapture=[bool]$Target.IP
+    if($null -ne $Target.CaptureNetwork){$networkCapture=[bool]$Target.CaptureNetwork}
+    if(-not $networkCapture -and -not $Target.Name){throw 'Для наблюдения без сети выберите установленный принтер по имени.'}
+    $localAddress = if($networkCapture){Get-SnifferLocalAddress $Target.IP}else{''}
+    $selfTarget = $networkCapture -and $localAddress -eq $Target.IP
     $selfPort = 0
     if ($selfTarget -and (-not [int]::TryParse([string]$Target.CapturePort, [ref]$selfPort) -or $selfPort -lt 1 -or $selfPort -gt 65535)) {
         throw 'Это IP самого компьютера. Без известного порта эмулятора захват затронет весь трафик ПК; выберите удалённый принтер.'
@@ -527,7 +559,7 @@ function Start-PrinterSnifferSession {
     $socket = $null
     $watcher = $null
     $watcherStopped = $false
-    $live = @{ SawJobs=$false; JobsSeen=0; Arrivals=0; QueueCount=$null; LastJob=''; WindowsReported=$false; Errors=0; PrintBytes=[uint64]0; LastPrint=[datetime]::MinValue; Resets=0; LastReset=[datetime]::MinValue; WatchFailed=$false }
+    $live = @{ PrinterName=$Target.Name; NetworkCapture=$networkCapture; Evidence=(New-Object 'System.Collections.Generic.List[string]'); EvidenceTruncated=$false; SawJobs=$false; JobsSeen=0; Arrivals=0; QueueCount=$null; LastJob=''; WindowsReported=$false; Errors=0; PrintBytes=[uint64]0; LastPrint=[datetime]::MinValue; Resets=0; LastReset=[datetime]::MinValue; WatchFailed=$false }
     $printPort = 0
     $null = [int]::TryParse([string]$Target.CapturePort, [ref]$printPort)
     $completed = $false
@@ -537,28 +569,36 @@ function Start-PrinterSnifferSession {
     $counts = @{}
     $reason = 'Пользователь остановил запись'
     try {
-        $writer.WriteLine('SCRIPTONITE — СНИФФЕР LAN-ПРИНТЕРА')
-        $writer.WriteLine("Принтер: $($Target.Name) | Цель IPv4: $($Target.IP) | Адаптер IPv4: $localAddress")
-        $writer.WriteLine('Захватываются только IPv4-пакеты с IP выбранной цели в источнике или назначении.')
-        $writer.WriteLine('Полный HEX/ASCII может содержать чеки и SNMP community. Не публикуйте отчёт без проверки содержимого.')
+        $writer.WriteLine('SCRIPTONITE — СНИФФЕР ПРИНТЕРА И ЖУРНАЛ ОТПРАВКИ')
+        $writer.WriteLine("Принтер: $($Target.Name) | Порт Windows: $($Target.Port) | Режим: $($Target.ConnectionType)")
+        if($networkCapture){
+            $writer.WriteLine("Цель IPv4: $($Target.IP) | Адаптер IPv4: $localAddress")
+            $writer.WriteLine('Захватываются только IPv4-пакеты с IP выбранной цели в источнике или назначении.')
+            $writer.WriteLine('Полный HEX/ASCII может содержать чеки и SNMP community. Не публикуйте отчёт без проверки содержимого.')
+        }else{
+            $writer.WriteLine('Наблюдение за выбранной очередью Windows, включая USB. Сырые USB-пакеты не перехватываются; передача USB-байтов не подтверждается.')
+        }
         $writer.WriteLine('Поступление и состояния заданий отслеживаются через очередь Windows и уведомления Spooler; событие 307 используется только если журнал уже включён.')
         $writer.WriteLine('PRINTED/COMPLETE и событие 307 отражают сообщение Windows, а не гарантированный выход бумаги. Данные на TCP-порту могут быть служебными, а не документом.')
         $writer.WriteLine('ARP, IPv6 и USB-трафик не захватываются. Пакеты между другими компьютерами и принтером могут не доходить до этого ПК.')
         $writer.WriteLine('Если IP принтера изменится, фильтр останется на исходном IP. Потери в буферах Windows этим способом не измеряются.')
         if ($selfTarget) { $writer.WriteLine("Цель находится на этом ПК: дополнительно фильтруется порт $selfPort. Локальный loopback-обмен raw-сокет может не показать.") }
-        $writer.WriteLine("Лимит пакетной части: $LimitMegabytes МБ. Файл не перезаписывается по кругу; при достижении лимита запись останавливается.")
+        $writer.WriteLine("Лимит основной записи: $LimitMegabytes МБ. Файл не перезаписывается по кругу; при достижении лимита запись останавливается.")
         Write-Host 'Снимаю состояние ДО...' -ForegroundColor Cyan
         $before = Get-SnifferSnapshot $Target.Name $Target.IP $localAddress
         Write-SnifferSnapshot $writer $before 'СОСТОЯНИЕ ДО'
-        $socket = New-Object Net.Sockets.Socket([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Raw, [Net.Sockets.ProtocolType]::IP)
-        $socket.Bind((New-Object Net.IPEndPoint([Net.IPAddress]::Parse($localAddress),0)))
-        $socket.ReceiveBufferSize = 8388608
-        $null = $socket.IOControl([Net.Sockets.IOControlCode]::ReceiveAll, [byte[]](1,0,0,0), $null)
-        $buffer = New-Object byte[] 65535
+        if($networkCapture){
+            $socket = New-Object Net.Sockets.Socket([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Raw, [Net.Sockets.ProtocolType]::IP)
+            $socket.Bind((New-Object Net.IPEndPoint([Net.IPAddress]::Parse($localAddress),0)))
+            $socket.ReceiveBufferSize = 8388608
+            $null = $socket.IOControl([Net.Sockets.IOControlCode]::ReceiveAll, [byte[]](1,0,0,0), $null)
+            $buffer = New-Object byte[] 65535
+        }
         $started = Get-Date
         $watcher = Start-SnifferPrintWatcher -PrinterName $Target.Name -Started $started
-        $writer.WriteLine("`r`n================ ПАКЕТЫ | НАЧАЛО UTC $($started.ToUniversalTime().ToString('o')) ================")
-        Write-Host "`nЗАПИСЬ ИДЁТ: $($Target.Name) — $($Target.IP)" -ForegroundColor Green
+        $writer.WriteLine("`r`n================ НАЧАЛО ЗАПИСИ UTC $($started.ToUniversalTime().ToString('o')) ================")
+        Write-Host "`nЗАПИСЬ ИДЁТ: $($Target.Name) | Порт: $($Target.Port) | $($Target.ConnectionType)" -ForegroundColor Green
+        if(-not $networkCapture){Write-Host 'Записываются события выбранной очереди Windows; USB-трафик напрямую не захватывается.' -ForegroundColor DarkGray}
         Write-Host "TXT: $path" -ForegroundColor Cyan
         Write-Host '[0] СТОП — также можно нажать Enter или Esc' -ForegroundColor Yellow
         Write-Host 'Теперь меняйте настройки, переустанавливайте драйвер или запускайте печать.'
@@ -568,7 +608,7 @@ function Start-PrinterSnifferSession {
         while ($true) {
             if (Test-PrinterSnifferStop) { break }
             Receive-SnifferPrintMessages $watcher $live $writer
-            if ($socket.Poll(100000, [Net.Sockets.SelectMode]::SelectRead)) {
+            if ($socket -and $socket.Poll(100000, [Net.Sockets.SelectMode]::SelectRead)) {
                 $length = $socket.Receive($buffer)
                 $packet = Read-SnifferPacket $buffer $length
                 $matchesTarget = $packet -and ($packet.Source -eq $Target.IP -or $packet.Destination -eq $Target.IP)
@@ -583,8 +623,7 @@ function Start-PrinterSnifferSession {
                         $now = Get-Date
                         if (($now-$live.LastPrint).TotalSeconds -gt 2) {
                             $notice = "ДАННЫЕ НА ПОРТ ПЕЧАТИ: $($Target.IP):$printPort. Наличие задания и выход чека этим ещё не подтверждены."
-                            Write-Host $notice -ForegroundColor Cyan
-                            $writer.WriteLine("$([DateTime]::UtcNow.ToString('o')) [PRINT_DATA] $notice")
+                            Write-SnifferEvidenceEvent $writer $live 'PRINT_DATA' $notice 'Cyan'
                         }
                         $live.LastPrint=$now; $live.PrintBytes+=$packet.PayloadLength
                     }
@@ -593,21 +632,23 @@ function Start-PrinterSnifferSession {
                         $now = Get-Date
                         if (($now-$live.LastReset).TotalSeconds -gt 1) {
                             $notice='TCP RST на канале печати: соединение сброшено. Итог задания по одному пакету не определяется.'
-                            Write-Host $notice -ForegroundColor Red
-                            $writer.WriteLine("$([DateTime]::UtcNow.ToString('o')) [PRINT_TCP_RST] $notice")
+                            Write-SnifferEvidenceEvent $writer $live 'PRINT_TCP_RST' $notice 'Red'
                             $live.LastReset=$now
                         }
                     }
-                    if ($writer.BaseStream.Length -ge ([int64]$LimitMegabytes*1MB)) { $reason = 'Достигнут лимит размера TXT'; break }
                 }
-            }
+            }elseif(-not $socket){Start-Sleep -Milliseconds 100}
+            if ($writer.BaseStream.Length -ge ([int64]$LimitMegabytes*1MB)) { $reason = 'Достигнут лимит размера TXT'; break }
             $second = [int]$clock.Elapsed.TotalSeconds
             if ($second -ne $lastDisplay -and $second % 5 -eq 0) {
-                Write-Host "Идёт запись: $second с | Пакетов: $packets | IP-байт: $bytes | [0] Стоп" -ForegroundColor DarkGray
+                Write-Host "Идёт запись: $second с | [0] Стоп" -ForegroundColor DarkGray
+                if($networkCapture){Write-Host "IPv4-пакетов: $packets | IP-байт: $bytes" -ForegroundColor DarkGray}
                 $queueText=if($null -eq $live.QueueCount){'неизвестно'}else{[string]$live.QueueCount}
                 Write-Host "Документов сейчас в очереди: $queueText | Заданий замечено: $($live.JobsSeen) | Уведомлений о поступлении: $($live.Arrivals)" -ForegroundColor Yellow
                 $dataText=if($live.LastPrint -eq [datetime]::MinValue){'пока не замечены'}elseif(((Get-Date)-$live.LastPrint).TotalSeconds -lt 3){'ИДЁТ ПЕРЕДАЧА'}else{'передавались; последнее наблюдение '+$live.LastPrint.ToString('HH:mm:ss')}
-                Write-Host "Данные на печатный порт: $dataText"
+                if($networkCapture){Write-Host "Данные на печатный порт: $dataText"}
+                $receiptText=if($live.SawJobs){'ДА — задания в выбранной очереди зафиксированы'}else{'пока не замечены'}
+                Write-Host "Задания Windows: $receiptText" -ForegroundColor $(if($live.SawJobs){'Green'}else{'DarkGray'})
                 $resultText=if($live.Errors -gt 0){"За время записи были ошибки заданий: $($live.Errors). Смотрите события выше."}elseif($live.WindowsReported){'Windows сообщала о завершении; бумага не подтверждена'}else{'завершение печати пока не подтверждено'}
                 $resultColor=if($live.Errors -gt 0){'Red'}elseif($live.WindowsReported){'Green'}else{'DarkGray'}
                 Write-Host "Результат наблюдения: $resultText" -ForegroundColor $resultColor
@@ -617,14 +658,14 @@ function Start-PrinterSnifferSession {
         }
         $ended = Get-Date
         $clock.Stop()
-        $socket.Close(); $socket = $null
+        if($socket){$socket.Close(); $socket=$null}
         $watcherDone = Stop-SnifferPrintWatcher $watcher
         $watcherStopped = $true
         Receive-SnifferPrintMessages $watcher $live $writer
         if(-not $watcherDone){$writer.WriteLine('Наблюдатель очереди не завершил текущий запрос вовремя; сведения о заданиях могут быть неполными.')}
         $writer.WriteLine("`r`n================ ЗАПИСЬ ОСТАНОВЛЕНА ================")
         $writer.WriteLine("Конец UTC: $($ended.ToUniversalTime().ToString('o')) | Причина: $reason")
-        $writer.WriteLine("Пакетов: $packets | IP-байт: $bytes")
+        if($networkCapture){$writer.WriteLine("Пакетов: $packets | IP-байт: $bytes")}
         foreach ($protocol in ($counts.Keys | Sort-Object)) { $writer.WriteLine("${protocol}: $($counts[$protocol])") }
         Write-SnifferPrintSummary $writer $live
         Write-Host 'Запись остановлена. Снимаю состояние ПОСЛЕ и события печати...' -ForegroundColor Cyan
@@ -665,14 +706,14 @@ try {
     $Host.UI.RawUI.WindowTitle = 'Scriptonite — Сниффер принтера'
     while ($true) {
         Clear-Host
-        Write-Host 'СНИФФЕР LAN-ПРИНТЕРА — ВЫБЕРИТЕ ЦЕЛЬ' -ForegroundColor Cyan
+        Write-Host 'СНИФФЕР ПРИНТЕРА — USB / LAN / ОЧЕРЕДЬ WINDOWS' -ForegroundColor Cyan
         $targets = @(Get-SnifferTargets)
-        for ($i=0; $i -lt $targets.Count; $i++) { Write-Host "[$($i+1)] $($targets[$i].Name) | $($targets[$i].IP) | $($targets[$i].Port)" }
+        for ($i=0; $i -lt $targets.Count; $i++) { Write-Host "[$($i+1)] $($targets[$i].Name) | $($targets[$i].ConnectionType) | $($targets[$i].IP) | $($targets[$i].Port)" }
         $manualNumber = $targets.Count+1
         Write-Host "[$manualNumber] Ввести IPv4 вручную"
         Write-Host '[0] Выход'
         Write-Host "Отчёты рядом со скриптом: $OutputDirectory" -ForegroundColor DarkGray
-        Write-Host 'Содержимое пакетов записывается полностью, включая возможные данные чеков.' -ForegroundColor Yellow
+        Write-Host 'USB: события очереди и имена документов. LAN: дополнительно IPv4-пакеты, которые могут содержать данные чеков.' -ForegroundColor Yellow
         $number = 0
         if (-not [int]::TryParse([string](Read-Host 'Выбор'),[ref]$number) -or $number -lt 0 -or $number -gt $manualNumber) { continue }
         if ($number -eq 0) { return }
@@ -683,7 +724,7 @@ try {
                 Write-Host 'Введите IPv4 конкретного устройства, например 192.168.1.87.' -ForegroundColor Yellow
                 $null = Read-Host 'Enter — назад'; continue
             }
-            $target = [PSCustomObject]@{ Name=''; IP=$ip.ToString(); Port='ручной адрес'; CapturePort=0 }
+            $target = [PSCustomObject]@{ Name=''; IP=$ip.ToString(); Port='ручной адрес'; CapturePort=0; CaptureNetwork=$true; ConnectionType='LAN, ручной IP' }
             $portText=([string](Read-Host 'TCP-порт печати [9100], либо 0 если неизвестен')).Trim()
             if(-not $portText){$portText='9100'}
             $portNumber=0
@@ -692,7 +733,7 @@ try {
         } else { $target = $targets[$number-1] }
         try {
             $result = Start-PrinterSnifferSession -Target $target -Directory $OutputDirectory -LimitMegabytes $MaxMegabytes
-            if ($result.Completed) { Write-Host "`nГОТОВО. Пакетов: $($result.Packets)" -ForegroundColor Green }
+            if ($result.Completed) { Write-Host "`nГОТОВО. Отчёт сохранён." -ForegroundColor Green }
             else { Write-Host "Отчёт неполный: $($result.Error)" -ForegroundColor Yellow }
             Write-Host "TXT: $($result.Path)" -ForegroundColor Cyan
         } catch { Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red }
