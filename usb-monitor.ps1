@@ -2,11 +2,70 @@
 param(
     [ValidateRange(1, 3600)][int]$IntervalSeconds = 30,
     [switch]$ShowEmpty,
-    [switch]$Once
+    [switch]$Once,
+    [string]$OutputDirectory
 )
 
-$ErrorActionPreference = 'Stop'
+# BEGIN SCRIPTONITE ERROR LOGGING
+function Write-ScriptoniteError {
+    param([string]$Context='Script execution', $ErrorRecord, [string]$Message)
+    # No events and an intentional Ctrl+C are normal outcomes, not failures.
+    if($ErrorRecord -and ($ErrorRecord.FullyQualifiedErrorId -like 'NoMatchingEventsFound*' -or $ErrorRecord.Exception -is [System.Management.Automation.PipelineStoppedException])){return}
+    $state=$script:ScriptoniteErrorLog
+    if(-not $state){return}
+    $locked=$false
+    try{
+        [Threading.Monitor]::Enter($state.SyncRoot);$locked=$true
+        $detail=$Message
+        if($ErrorRecord){
+            $detail=($ErrorRecord | Out-String -Width 240).Trim()
+            $detail+=[Environment]::NewLine+'Error ID: '+$ErrorRecord.FullyQualifiedErrorId
+            $detail+=[Environment]::NewLine+'Exception: '+$ErrorRecord.Exception.ToString()
+            $detail+=[Environment]::NewLine+'Location: '+$ErrorRecord.InvocationInfo.PositionMessage
+            $detail+=[Environment]::NewLine+'Stack: '+$ErrorRecord.ScriptStackTrace
+        }
+        $key=$Context+'|'+$detail
+        $now=[DateTime]::UtcNow
+        # Preserve the first failure and repeated failures at most once a minute.
+        if($state.Recent.ContainsKey($key) -and ($now-$state.Recent[$key]).TotalSeconds -lt 60){return}
+        $line=$now.ToString('o')+' ['+$state.Script+'] ['+$Context+']'+[Environment]::NewLine+$detail+[Environment]::NewLine+[Environment]::NewLine
+        $paths=@()
+        if($state.Path){$paths+=$state.Path}
+        foreach($directory in $state.Directories){if($directory){$paths+=[IO.Path]::Combine($directory,$state.Name)}}
+        foreach($path in @($paths | Select-Object -Unique)){
+            try{
+                $fullPath=[IO.Path]::GetFullPath($path)
+                $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fullPath))
+                $encoding=New-Object Text.UTF8Encoding($true)
+                if(-not [IO.File]::Exists($fullPath)){
+                    $header='SCRIPTONITE - SCRIPT EXECUTION ERRORS'+[Environment]::NewLine+'Script: '+$state.Script+[Environment]::NewLine+'PowerShell: '+$PSVersionTable.PSVersion+[Environment]::NewLine
+                    [IO.File]::WriteAllText($fullPath,$header,$encoding)
+                }
+                [IO.File]::AppendAllText($fullPath,$line,$encoding)
+                if($state.Path -ne $fullPath){Write-Host ('Error log: '+$fullPath) -ForegroundColor Yellow}
+                $state.Path=$fullPath
+                if($state.Recent.Count -gt 512){$state.Recent.Clear()}
+                $state.Recent[$key]=$now
+                return
+            }catch{ }
+        }
+        if(-not $state.Failed){Write-Host 'Could not save the error log beside the script or on Desktop.' -ForegroundColor Red;$state.Failed=$true}
+    }catch{ }
+    finally{if($locked){[Threading.Monitor]::Exit($state.SyncRoot)}}
+}
+$errorDirectory=$OutputDirectory
+if(-not $errorDirectory -and $env:SCRIPTONITE_SOURCE){$errorDirectory=[IO.Path]::GetDirectoryName($env:SCRIPTONITE_SOURCE)}
+if(-not $errorDirectory -and $PSScriptRoot -and $PSScriptRoot -notmatch '[\\/]Scriptonite[\\/](scripts|launcher)([\\/]|$)'){$errorDirectory=$PSScriptRoot}
+if(-not $errorDirectory){$errorDirectory=[Environment]::GetFolderPath('Desktop')}
+$script:ScriptoniteErrorLog=@{
+    Script='usb-monitor';Path='';Failed=$false;Recent=@{};SyncRoot=(New-Object object)
+    Directories=@($errorDirectory,[Environment]::GetFolderPath('Desktop') | Where-Object {$_} | Select-Object -Unique)
+    Name=('ScriptoniteErrors_usb-monitor_{0}_{1}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'),[guid]::NewGuid().ToString('N').Substring(0,6))
+}
+trap { Write-ScriptoniteError -Context 'Unhandled script error' -ErrorRecord $_; break }
+# END SCRIPTONITE ERROR LOGGING
 
+$ErrorActionPreference = 'Stop'
 # Read-only USB hub IOCTLs documented in usbioctl.h (Windows 8+).
 # Connector metadata, not device class or CM_DEVCAP_REMOVABLE, decides whether
 # a port is externally accessible. One physical connector may have companions.
@@ -282,13 +341,16 @@ function ConvertTo-UsbInstanceId {
 
 function Get-UsbPrinterBindings {
     param([object[]]$Connectors)
+    # PnP CDXML cmdlets emit their own verbose progress records in Windows PS5.
+    # Keep the scanner's single progress indicator; this preference is local.
+    $ProgressPreference='SilentlyContinue'
     $warnings=New-Object 'System.Collections.Generic.List[string]'
     $names=@{};$queues=@{};$queueRead=$false
     $registryRoot='Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Print\Monitors\USB Monitor\Ports'
     try{foreach($key in @(Get-ChildItem -LiteralPath $registryRoot -ErrorAction Stop)){if($key.PSChildName -match '^USB[0-9]+$'){$names[$key.PSChildName]=$true}}}
-    catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){$warnings.Add('Не удалось перечислить привязки USB Monitor: '+$_.Exception.Message)}}
+    catch{Write-ScriptoniteError -Context 'Перечисление привязок USB Monitor' -ErrorRecord $_;if($_.CategoryInfo.Category -ne 'ObjectNotFound'){$warnings.Add('Не удалось перечислить привязки USB Monitor: '+$_.Exception.Message)}}
     try{foreach($port in @(Get-PrinterPort -ErrorAction Stop)){if($port.Name -match '^USB[0-9]+$'){$names[$port.Name]=$true}}}
-    catch{$warnings.Add('Не удалось прочитать список портов печати: '+$_.Exception.Message)}
+    catch{Write-ScriptoniteError -Context 'Список портов печати' -ErrorRecord $_;$warnings.Add('Не удалось прочитать список портов печати: '+$_.Exception.Message)}
     try{
         foreach($printer in @(Get-Printer -ErrorAction Stop)){
             foreach($portName in @($printer.PortName -split ',\s*')){
@@ -299,7 +361,7 @@ function Get-UsbPrinterBindings {
             }
         }
         $queueRead=$true
-    }catch{$warnings.Add('Не удалось прочитать очереди печати: '+$_.Exception.Message)}
+    }catch{Write-ScriptoniteError -Context 'Список очередей печати' -ErrorRecord $_;$warnings.Add('Не удалось прочитать очереди печати: '+$_.Exception.Message)}
     $byInstance=@{}
     foreach($connector in $Connectors){
         if($connector.InstanceId -and $connector.Status -gt 0){
@@ -318,7 +380,7 @@ function Get-UsbPrinterBindings {
                 $value=$data.PSObject.Properties[$field]
                 if($value -and $value.Value -is [string]){$deviceId=ConvertTo-UsbInstanceId $value.Value;if($deviceId){break}}
             }
-        }catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){$readError=$_.Exception.Message}}
+        }catch{Write-ScriptoniteError -Context ("USB Monitor: $name") -ErrorRecord $_;if($_.CategoryInfo.Category -ne 'ObjectNotFound'){$readError=$_.Exception.Message}}
         $chain=New-Object 'System.Collections.Generic.List[string]'
         $id=$deviceId;$match=$null;$vidPid='-';$viaHub=$false
         for($depth=0;$id -and $depth -lt 32;$depth++){
@@ -333,7 +395,7 @@ function Get-UsbPrinterBindings {
             if(!$propertyApi){break}
             if(!$parentCache.ContainsKey($id)){
                 $parent=''
-                try{$prop=Get-PnpDeviceProperty -InstanceId $id -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop | Where-Object InstanceId -eq $id | Select-Object -First 1;$parent=[string]$prop.Data}catch{}
+                try{$prop=Get-PnpDeviceProperty -InstanceId $id -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop | Where-Object InstanceId -eq $id | Select-Object -First 1;$parent=[string]$prop.Data}catch{Write-ScriptoniteError -Context ("PnP Parent: $name | $id") -ErrorRecord $_}
                 $parentCache[$id]=$parent
             }
             $id=$parentCache[$id]
@@ -379,6 +441,7 @@ try {
         Write-Host "ФИЗИЧЕСКИЕ USB-ПОРТЫ | Проверка №$cycle | $(Get-Date)" -ForegroundColor Cyan
         Write-Host 'Опрашиваю разъёмы через USB-хабы...'
         $scan = [ScriptonitePhysicalUsb.Reader]::Scan()
+        foreach($warning in $scan.Warnings){Write-ScriptoniteError -Context 'Опрос USB-хабов' -Message $warning}
         $connectors = @(Merge-UsbConnectors $scan.Ports)
         $current = @{}
         foreach ($connector in $connectors) {
@@ -387,6 +450,8 @@ try {
             $current[$connector.Key] = $connector
         }
         $missingMetadata = @($scan.Ports | Where-Object { -not $_.ConnectorKnown }).Count
+        if($missingMetadata){Write-ScriptoniteError -Context 'Метаданные USB-разъёмов' -Message ("Не получены сведения о назначении $missingMetadata портов")}
+        foreach($badPort in @($scan.Ports | Where-Object {$_.Status -gt 1})){Write-ScriptoniteError -Context 'Состояние USB-устройства' -Message ("$($badPort.Key) | код USB: $($badPort.Status)")}
         $complete = $scan.Warnings.Count -eq 0 -and $missingMetadata -eq 0
         if ($complete) {
             foreach ($message in @(Get-UsbPortChanges $previous $current)) {
@@ -428,6 +493,7 @@ try {
             foreach ($warning in $scan.Warnings) { Write-Host $warning -ForegroundColor DarkYellow }
         }
         Write-Host 'USB 1, USB 2... — локальные метки; расположение на корпусе определяется переподключением.' -ForegroundColor DarkGray
+        if($script:ScriptoniteErrorLog.Path){Write-Host ("Журнал ошибок: "+$script:ScriptoniteErrorLog.Path) -ForegroundColor DarkGray}
         if ($events.Count) { Write-Host "`nСОБЫТИЯ:" -ForegroundColor Cyan; foreach ($entry in $events) { Write-Host $entry -ForegroundColor Yellow } }
         Write-Host "`nEnter — проверить сейчас. Повтор через $IntervalSeconds с. Ctrl+C — выход."
         if ($Once) { break }
@@ -437,7 +503,7 @@ try {
             Start-Sleep -Milliseconds 100
         }
     }
-} catch {
+} catch {Write-ScriptoniteError -Context 'USB-сканер: остановлен с ошибкой' -ErrorRecord $_
     Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
     if (-not $Once) { $null = Read-Host 'Нажмите Enter для выхода' }
     else { throw }

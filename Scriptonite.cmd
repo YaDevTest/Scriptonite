@@ -2,7 +2,7 @@
 setlocal
 title Scriptonite
 set "SCRIPTONITE_SOURCE=%~f0"
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $text=[IO.File]::ReadAllText($env:SCRIPTONITE_SOURCE,[Text.Encoding]::UTF8); $marker='#==SCRIPTONITE_PS1==#'; $offset=$text.LastIndexOf($marker); if ($offset -lt 0) { throw 'Embedded script was not found.' }; $payload=$text.Substring($offset+$marker.Length); $root=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Scriptonite\launcher'; $run=Join-Path $root ([Guid]::NewGuid().ToString('N')); $null=New-Item -ItemType Directory -Path $run -Force; $entry=Join-Path $run 'Scriptonite.ps1'; [IO.File]::WriteAllText($entry,$payload,(New-Object Text.UTF8Encoding($true))); & $entry } catch { Write-Host ('Scriptonite: '+$_.Exception.Message) -ForegroundColor Red; exit 1 }"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { $text=[IO.File]::ReadAllText($env:SCRIPTONITE_SOURCE,[Text.Encoding]::UTF8); $marker='#==SCRIPTONITE_PS1==#'; $offset=$text.LastIndexOf($marker); if ($offset -lt 0) { throw 'Embedded script was not found.' }; $payload=$text.Substring($offset+$marker.Length); $root=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Scriptonite\launcher'; $run=Join-Path $root ([Guid]::NewGuid().ToString('N')); $null=New-Item -ItemType Directory -Path $run -Force; $entry=Join-Path $run 'Scriptonite.ps1'; [IO.File]::WriteAllText($entry,$payload,(New-Object Text.UTF8Encoding($true))); & $entry } catch { $failure=$_; $saved=$false; $name='ScriptoniteErrors_cmd_'+(Get-Date -Format 'yyyyMMdd_HHmmss')+'_'+[guid]::NewGuid().ToString('N').Substring(0,6)+'.txt'; foreach($dir in @([IO.Path]::GetDirectoryName($env:SCRIPTONITE_SOURCE),[Environment]::GetFolderPath('Desktop'))){try{$log=Join-Path $dir $name; [IO.File]::WriteAllText($log,('SCRIPTONITE CMD - '+[DateTime]::UtcNow.ToString('o')+[Environment]::NewLine+$failure.Exception.ToString()+[Environment]::NewLine+$failure.InvocationInfo.PositionMessage+[Environment]::NewLine+$failure.ScriptStackTrace),(New-Object Text.UTF8Encoding($true))); Write-Host ('Error log: '+$log) -ForegroundColor Yellow; $saved=$true; break}catch{}}; if(-not $saved){Write-Host 'Could not save error log beside CMD or on Desktop.' -ForegroundColor Red}; Write-Host ('Scriptonite: '+$failure.Exception.Message) -ForegroundColor Red; exit 1 }"
 if errorlevel 1 (
     echo Scriptonite could not start.
     pause
@@ -11,6 +11,65 @@ exit /b
 #==SCRIPTONITE_PS1==#
 [CmdletBinding()]
 param([string]$ReportDirectory)
+
+# BEGIN SCRIPTONITE ERROR LOGGING
+function Write-ScriptoniteError {
+    param([string]$Context='Script execution', $ErrorRecord, [string]$Message)
+    # No events and an intentional Ctrl+C are normal outcomes, not failures.
+    if($ErrorRecord -and ($ErrorRecord.FullyQualifiedErrorId -like 'NoMatchingEventsFound*' -or $ErrorRecord.Exception -is [System.Management.Automation.PipelineStoppedException])){return}
+    $state=$script:ScriptoniteErrorLog
+    if(-not $state){return}
+    $locked=$false
+    try{
+        [Threading.Monitor]::Enter($state.SyncRoot);$locked=$true
+        $detail=$Message
+        if($ErrorRecord){
+            $detail=($ErrorRecord | Out-String -Width 240).Trim()
+            $detail+=[Environment]::NewLine+'Error ID: '+$ErrorRecord.FullyQualifiedErrorId
+            $detail+=[Environment]::NewLine+'Exception: '+$ErrorRecord.Exception.ToString()
+            $detail+=[Environment]::NewLine+'Location: '+$ErrorRecord.InvocationInfo.PositionMessage
+            $detail+=[Environment]::NewLine+'Stack: '+$ErrorRecord.ScriptStackTrace
+        }
+        $key=$Context+'|'+$detail
+        $now=[DateTime]::UtcNow
+        # Preserve the first failure and repeated failures at most once a minute.
+        if($state.Recent.ContainsKey($key) -and ($now-$state.Recent[$key]).TotalSeconds -lt 60){return}
+        $line=$now.ToString('o')+' ['+$state.Script+'] ['+$Context+']'+[Environment]::NewLine+$detail+[Environment]::NewLine+[Environment]::NewLine
+        $paths=@()
+        if($state.Path){$paths+=$state.Path}
+        foreach($directory in $state.Directories){if($directory){$paths+=[IO.Path]::Combine($directory,$state.Name)}}
+        foreach($path in @($paths | Select-Object -Unique)){
+            try{
+                $fullPath=[IO.Path]::GetFullPath($path)
+                $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fullPath))
+                $encoding=New-Object Text.UTF8Encoding($true)
+                if(-not [IO.File]::Exists($fullPath)){
+                    $header='SCRIPTONITE - SCRIPT EXECUTION ERRORS'+[Environment]::NewLine+'Script: '+$state.Script+[Environment]::NewLine+'PowerShell: '+$PSVersionTable.PSVersion+[Environment]::NewLine
+                    [IO.File]::WriteAllText($fullPath,$header,$encoding)
+                }
+                [IO.File]::AppendAllText($fullPath,$line,$encoding)
+                if($state.Path -ne $fullPath){Write-Host ('Error log: '+$fullPath) -ForegroundColor Yellow}
+                $state.Path=$fullPath
+                if($state.Recent.Count -gt 512){$state.Recent.Clear()}
+                $state.Recent[$key]=$now
+                return
+            }catch{ }
+        }
+        if(-not $state.Failed){Write-Host 'Could not save the error log beside the script or on Desktop.' -ForegroundColor Red;$state.Failed=$true}
+    }catch{ }
+    finally{if($locked){[Threading.Monitor]::Exit($state.SyncRoot)}}
+}
+$errorDirectory=$ReportDirectory
+if(-not $errorDirectory -and $env:SCRIPTONITE_SOURCE){$errorDirectory=[IO.Path]::GetDirectoryName($env:SCRIPTONITE_SOURCE)}
+if(-not $errorDirectory -and $PSScriptRoot -and $PSScriptRoot -notmatch '[\\/]Scriptonite[\\/](scripts|launcher)([\\/]|$)'){$errorDirectory=$PSScriptRoot}
+if(-not $errorDirectory){$errorDirectory=[Environment]::GetFolderPath('Desktop')}
+$script:ScriptoniteErrorLog=@{
+    Script='Scriptonite';Path='';Failed=$false;Recent=@{};SyncRoot=(New-Object object)
+    Directories=@($errorDirectory,[Environment]::GetFolderPath('Desktop') | Where-Object {$_} | Select-Object -Unique)
+    Name=('ScriptoniteErrors_Scriptonite_{0}_{1}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'),[guid]::NewGuid().ToString('N').Substring(0,6))
+}
+trap { Write-ScriptoniteError -Context 'Unhandled script error' -ErrorRecord $_; break }
+# END SCRIPTONITE ERROR LOGGING
 
 $ErrorActionPreference = 'Stop'
 
@@ -54,7 +113,7 @@ function Start-ScriptoniteElevated {
             '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded
         ) | Out-Null
         return $true
-    } catch {
+    } catch { Write-ScriptoniteError -Context 'Scriptonite.ps1 / Start-ScriptoniteElevated / catch at line 46' -ErrorRecord $_; 
         Write-Host ''
         Write-Host 'Scriptonite нужны права администратора.' -ForegroundColor Yellow
         Write-Host 'Разрешение не получено. Скрипты не запущены.' -ForegroundColor Yellow
@@ -130,7 +189,7 @@ function Get-ScriptoniteDownloadBytes {
         if($total -ge 0 -and $received -ne $total){throw "Incomplete download: $received of $total bytes."}
         . $showProgress $true
         return ,$memory.ToArray()
-    } catch {
+    } catch { Write-ScriptoniteError -Context 'Scriptonite.ps1 / Get-ScriptoniteDownloadBytes / catch at line 122' -ErrorRecord $_; 
         if($cancel -and $cancel.IsCancellationRequested){throw "Download timed out after $TimeoutSeconds seconds."}
         throw
     } finally {
@@ -216,9 +275,9 @@ if (-not (Test-ScriptoniteAdministrator)) {
 }
 
 $catalog = [ordered]@{
-    '1' = @{ Name = 'Монитор сети'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/network-monitor.ps1' }
-    '2' = @{ Name = 'Монитор USB'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/usb-monitor.ps1' }
-    '3' = @{ Name = 'Монитор принтеров'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/printer-monitor.ps1' }
+    '1' = @{ Name = 'Монитор сети'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/network-monitor.ps1'; Report=$true }
+    '2' = @{ Name = 'Монитор USB'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/usb-monitor.ps1'; Report=$true }
+    '3' = @{ Name = 'Монитор принтеров'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/printer-monitor.ps1'; Report=$true }
     '4' = @{ Name = 'Сниффер принтера (USB / LAN)'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/printer-sniffer.ps1'; Report=$true }
     '5' = @{ Name = 'Сниффер всей системы печати'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/print-system-sniffer.ps1'; Report=$true }
 }
@@ -249,7 +308,7 @@ while ($true) {
         if($selected.Report){Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath -OutputDirectory $ReportDirectory}
         else{Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath}
         $status = "$($selected.Name) запущен в отдельном окне. Меню готово к работе."
-    } catch {
+    } catch { Write-ScriptoniteError -Context 'Scriptonite.ps1 / Main / catch at line 241' -ErrorRecord $_; 
         Write-Host "Не удалось запустить $($selected.Name): $($_.Exception.Message)" -ForegroundColor Red
         $status = "Скрипт не запущен. Можно повторить выбор [$choice]."
         $null = Read-Host 'Нажмите Enter для возврата в меню'

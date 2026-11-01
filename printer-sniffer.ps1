@@ -4,6 +4,65 @@ param(
     [ValidateRange(1, 4096)][int]$MaxMegabytes = 256
 )
 
+# BEGIN SCRIPTONITE ERROR LOGGING
+function Write-ScriptoniteError {
+    param([string]$Context='Script execution', $ErrorRecord, [string]$Message)
+    # No events and an intentional Ctrl+C are normal outcomes, not failures.
+    if($ErrorRecord -and ($ErrorRecord.FullyQualifiedErrorId -like 'NoMatchingEventsFound*' -or $ErrorRecord.Exception -is [System.Management.Automation.PipelineStoppedException])){return}
+    $state=$script:ScriptoniteErrorLog
+    if(-not $state){return}
+    $locked=$false
+    try{
+        [Threading.Monitor]::Enter($state.SyncRoot);$locked=$true
+        $detail=$Message
+        if($ErrorRecord){
+            $detail=($ErrorRecord | Out-String -Width 240).Trim()
+            $detail+=[Environment]::NewLine+'Error ID: '+$ErrorRecord.FullyQualifiedErrorId
+            $detail+=[Environment]::NewLine+'Exception: '+$ErrorRecord.Exception.ToString()
+            $detail+=[Environment]::NewLine+'Location: '+$ErrorRecord.InvocationInfo.PositionMessage
+            $detail+=[Environment]::NewLine+'Stack: '+$ErrorRecord.ScriptStackTrace
+        }
+        $key=$Context+'|'+$detail
+        $now=[DateTime]::UtcNow
+        # Preserve the first failure and repeated failures at most once a minute.
+        if($state.Recent.ContainsKey($key) -and ($now-$state.Recent[$key]).TotalSeconds -lt 60){return}
+        $line=$now.ToString('o')+' ['+$state.Script+'] ['+$Context+']'+[Environment]::NewLine+$detail+[Environment]::NewLine+[Environment]::NewLine
+        $paths=@()
+        if($state.Path){$paths+=$state.Path}
+        foreach($directory in $state.Directories){if($directory){$paths+=[IO.Path]::Combine($directory,$state.Name)}}
+        foreach($path in @($paths | Select-Object -Unique)){
+            try{
+                $fullPath=[IO.Path]::GetFullPath($path)
+                $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fullPath))
+                $encoding=New-Object Text.UTF8Encoding($true)
+                if(-not [IO.File]::Exists($fullPath)){
+                    $header='SCRIPTONITE - SCRIPT EXECUTION ERRORS'+[Environment]::NewLine+'Script: '+$state.Script+[Environment]::NewLine+'PowerShell: '+$PSVersionTable.PSVersion+[Environment]::NewLine
+                    [IO.File]::WriteAllText($fullPath,$header,$encoding)
+                }
+                [IO.File]::AppendAllText($fullPath,$line,$encoding)
+                if($state.Path -ne $fullPath){Write-Host ('Error log: '+$fullPath) -ForegroundColor Yellow}
+                $state.Path=$fullPath
+                if($state.Recent.Count -gt 512){$state.Recent.Clear()}
+                $state.Recent[$key]=$now
+                return
+            }catch{ }
+        }
+        if(-not $state.Failed){Write-Host 'Could not save the error log beside the script or on Desktop.' -ForegroundColor Red;$state.Failed=$true}
+    }catch{ }
+    finally{if($locked){[Threading.Monitor]::Exit($state.SyncRoot)}}
+}
+$errorDirectory=$OutputDirectory
+if(-not $errorDirectory -and $env:SCRIPTONITE_SOURCE){$errorDirectory=[IO.Path]::GetDirectoryName($env:SCRIPTONITE_SOURCE)}
+if(-not $errorDirectory -and $PSScriptRoot -and $PSScriptRoot -notmatch '[\\/]Scriptonite[\\/](scripts|launcher)([\\/]|$)'){$errorDirectory=$PSScriptRoot}
+if(-not $errorDirectory){$errorDirectory=[Environment]::GetFolderPath('Desktop')}
+$script:ScriptoniteErrorLog=@{
+    Script='printer-sniffer';Path='';Failed=$false;Recent=@{};SyncRoot=(New-Object object)
+    Directories=@($errorDirectory,[Environment]::GetFolderPath('Desktop') | Where-Object {$_} | Select-Object -Unique)
+    Name=('ScriptoniteErrors_printer-sniffer_{0}_{1}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'),[guid]::NewGuid().ToString('N').Substring(0,6))
+}
+trap { Write-ScriptoniteError -Context 'Unhandled script error' -ErrorRecord $_; break }
+# END SCRIPTONITE ERROR LOGGING
+
 $ErrorActionPreference = 'Stop'
 if (-not $OutputDirectory) { $OutputDirectory = $PSScriptRoot }
 if (-not $OutputDirectory) { $OutputDirectory = (Get-Location).Path }
@@ -70,7 +129,7 @@ function Get-SnifferJobObservations {
     $seen = @{}
     foreach ($job in $Jobs) {
         $stamp = [string]$job.SubmittedTime
-        try { if ($job.SubmittedTime) { $stamp = ([datetime]$job.SubmittedTime).ToUniversalTime().ToString('o') } } catch {}
+        try { if ($job.SubmittedTime) { $stamp = ([datetime]$job.SubmittedTime).ToUniversalTime().ToString('o') } } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Get-SnifferJobObservations / catch at line 73' -ErrorRecord $_; }
         $key = "$($job.ID)|$stamp"
         $seen[$key] = $true
         $flags = [uint32]$job.JobStatus
@@ -119,7 +178,7 @@ function Start-SnifferPrintWatcher {
     if (-not $script:PendingPrinterWatchers) { $script:PendingPrinterWatchers=New-Object 'System.Collections.Generic.List[object]' }
     foreach($old in @($script:PendingPrinterWatchers.ToArray())) {
         if($old.Async.IsCompleted) {
-            try{$null=$old.PowerShell.EndInvoke($old.Async)}catch{}
+            try{$null=$old.PowerShell.EndInvoke($old.Async)}catch{ Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Start-SnifferPrintWatcher / catch at line 122' -ErrorRecord $_; }
             $old.PowerShell.Dispose();$old.Runspace.Dispose();$old.Cancel.Dispose()
             $null=$script:PendingPrinterWatchers.Remove($old)
         }
@@ -130,10 +189,60 @@ function Start-SnifferPrintWatcher {
     }
     $nativeAvailable = $true
     try { if (-not ('ScriptonitePrinterWatch.Notifications' -as [type])) { Add-Type -TypeDefinition $script:PrinterNotifySource -Language CSharp } }
-    catch { $nativeAvailable=$false; $queue.Enqueue([PSCustomObject]@{Code='INFO';Text='Уведомления Spooler не удалось подключить. Быстрые задания могут быть пропущены опросом.';Color='Yellow';Count=0}) }
+    catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Start-SnifferPrintWatcher / catch at line 133' -ErrorRecord $_;  $nativeAvailable=$false; $queue.Enqueue([PSCustomObject]@{Code='INFO';Text='Уведомления Spooler не удалось подключить. Быстрые задания могут быть пропущены опросом.';Color='Yellow';Count=0}) }
     $helpers = "function Get-SnifferJobStatus {`n$((Get-Command Get-SnifferJobStatus).Definition)`n}`nfunction Get-SnifferJobObservations {`n$((Get-Command Get-SnifferJobObservations).Definition)`n}`n"
     $body = @'
-param($Name, $Started, $Messages, $Cancellation, $UseNotifications)
+param($Name, $Started, $Messages, $Cancellation, $UseNotifications, $ErrorLogState)
+$script:ScriptoniteErrorLog=$ErrorLogState
+function Write-ScriptoniteError {
+
+    param([string]$Context='Script execution', $ErrorRecord, [string]$Message)
+    # No events and an intentional Ctrl+C are normal outcomes, not failures.
+    if($ErrorRecord -and ($ErrorRecord.FullyQualifiedErrorId -like 'NoMatchingEventsFound*' -or $ErrorRecord.Exception -is [System.Management.Automation.PipelineStoppedException])){return}
+    $state=$script:ScriptoniteErrorLog
+    if(-not $state){return}
+    $locked=$false
+    try{
+        [Threading.Monitor]::Enter($state.SyncRoot);$locked=$true
+        $detail=$Message
+        if($ErrorRecord){
+            $detail=($ErrorRecord | Out-String -Width 240).Trim()
+            $detail+=[Environment]::NewLine+'Error ID: '+$ErrorRecord.FullyQualifiedErrorId
+            $detail+=[Environment]::NewLine+'Exception: '+$ErrorRecord.Exception.ToString()
+            $detail+=[Environment]::NewLine+'Location: '+$ErrorRecord.InvocationInfo.PositionMessage
+            $detail+=[Environment]::NewLine+'Stack: '+$ErrorRecord.ScriptStackTrace
+        }
+        $key=$Context+'|'+$detail
+        $now=[DateTime]::UtcNow
+        # Preserve the first failure and repeated failures at most once a minute.
+        if($state.Recent.ContainsKey($key) -and ($now-$state.Recent[$key]).TotalSeconds -lt 60){return}
+        $line=$now.ToString('o')+' ['+$state.Script+'] ['+$Context+']'+[Environment]::NewLine+$detail+[Environment]::NewLine+[Environment]::NewLine
+        $paths=@()
+        if($state.Path){$paths+=$state.Path}
+        foreach($directory in $state.Directories){if($directory){$paths+=[IO.Path]::Combine($directory,$state.Name)}}
+        foreach($path in @($paths | Select-Object -Unique)){
+            try{
+                $fullPath=[IO.Path]::GetFullPath($path)
+                $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fullPath))
+                $encoding=New-Object Text.UTF8Encoding($true)
+                if(-not [IO.File]::Exists($fullPath)){
+                    $header='SCRIPTONITE - SCRIPT EXECUTION ERRORS'+[Environment]::NewLine+'Script: '+$state.Script+[Environment]::NewLine+'PowerShell: '+$PSVersionTable.PSVersion+[Environment]::NewLine
+                    [IO.File]::WriteAllText($fullPath,$header,$encoding)
+                }
+                [IO.File]::AppendAllText($fullPath,$line,$encoding)
+                if($state.Path -ne $fullPath){Write-Host ('Error log: '+$fullPath) -ForegroundColor Yellow}
+                $state.Path=$fullPath
+                if($state.Recent.Count -gt 512){$state.Recent.Clear()}
+                $state.Recent[$key]=$now
+                return
+            }catch{ }
+        }
+        if(-not $state.Failed){Write-Host 'Could not save the error log beside the script or on Desktop.' -ForegroundColor Red;$state.Failed=$true}
+    }catch{ }
+    finally{if($locked){[Threading.Monitor]::Exit($state.SyncRoot)}}
+
+}
+trap { Write-ScriptoniteError -Context 'Background worker failed' -ErrorRecord $_; break }
 $ErrorActionPreference='Stop'
 function Send-Notice($Code, $Text, $Color='Yellow', $Count=1) {
     $Messages.Enqueue([PSCustomObject]@{ Code=$Code; Text=$Text; Color=$Color; Count=$Count })
@@ -150,20 +259,20 @@ $state=@{Records=@{}}
 $eventIds=@{}
 $operational=$false
 try {
-    try { $operational=(Get-WinEvent -ListLog 'Microsoft-Windows-PrintService/Operational' -ErrorAction Stop).IsEnabled } catch {}
+    try { $operational=(Get-WinEvent -ListLog 'Microsoft-Windows-PrintService/Operational' -ErrorAction Stop).IsEnabled } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / body / Main / catch at line 18' -ErrorRecord $_; }
     if(-not $operational){Send-Notice INFO 'Журнал завершений печати отключён или недоступен. Исчезновение задания само по себе не считается успешной печатью.'}
     while(-not $Cancellation.IsCancellationRequested){
         $now=Get-Date
         if($UseNotifications -and -not $notification -and ($now-$lastOpen).TotalSeconds -ge 3){
             $lastOpen=$now
             try{$notification=New-Object ScriptonitePrinterWatch.Notifications($Name);$lastNotifyError=''}
-            catch{if($lastNotifyError -ne $_.Exception.Message){Send-Notice INFO 'Уведомления Spooler недоступны; остаётся опрос очереди. Быстрые задания могут быть пропущены.';$lastNotifyError=$_.Exception.Message}}
+            catch{ Write-ScriptoniteError -Context 'printer-sniffer.ps1 / body / Main / catch at line 25' -ErrorRecord $_; if($lastNotifyError -ne $_.Exception.Message){Send-Notice INFO 'Уведомления Spooler недоступны; остаётся опрос очереди. Быстрые задания могут быть пропущены.';$lastNotifyError=$_.Exception.Message}}
         }
         if($notification){
             try{
                 $flags=$notification.ReadChanges()
                 if($flags -band 0x100){Send-Notice QUEUE_ARRIVAL 'ПОСТУПЛЕНИЕ: Windows сообщила о добавлении задания в выбранную очередь.' Cyan}
-            }catch{
+            }catch{ Write-ScriptoniteError -Context 'printer-sniffer.ps1 / body / Main / catch at line 31' -ErrorRecord $_; 
                 $notification.Dispose();$notification=$null
                 Send-Notice INFO 'Связь с уведомлениями Spooler прервалась. Пробую подключиться снова.'
             }
@@ -178,7 +287,7 @@ try {
                     }else{$Messages.Enqueue($event)}
                 }
                 $first=$false;$lastQueueError=''
-            }catch{
+            }catch{ Write-ScriptoniteError -Context 'printer-sniffer.ps1 / body / Main / catch at line 46' -ErrorRecord $_; 
                 if($lastQueueError -ne $_.Exception.Message){Send-Notice WATCH_ERROR ('Не удалось прочитать очередь: '+$_.Exception.Message) Red;$lastQueueError=$_.Exception.Message}
             }
         }
@@ -202,7 +311,7 @@ try {
                     $sizeText=if($size){$size.InnerText+' байт'}else{'размер недоступен'}
                     Send-Notice WINDOWS_COMPLETED "Windows зарегистрировала завершение задания #$($id.InnerText) «$documentName» | $sizeText (событие 307). Фактический выход чека не подтверждён." Green
                 }
-            }catch{}
+            }catch{ Write-ScriptoniteError -Context 'printer-sniffer.ps1 / body / Main / catch at line 70' -ErrorRecord $_; }
         }
         $null=$Cancellation.Token.WaitHandle.WaitOne(50)
     }
@@ -214,7 +323,7 @@ try {
     $runspace.Open()
     $powershell = [PowerShell]::Create()
     $powershell.Runspace=$runspace
-    $null=$powershell.AddScript($code).AddArgument($PrinterName).AddArgument($Started).AddArgument($queue).AddArgument($cancel).AddArgument($nativeAvailable)
+    $null=$powershell.AddScript($code).AddArgument($PrinterName).AddArgument($Started).AddArgument($queue).AddArgument($cancel).AddArgument($nativeAvailable).AddArgument($script:ScriptoniteErrorLog)
     $async=$powershell.BeginInvoke()
     return [PSCustomObject]@{ Queue=$queue; Cancel=$cancel; PowerShell=$powershell; Runspace=$runspace; Async=$async }
 }
@@ -226,11 +335,11 @@ function Stop-SnifferPrintWatcher {
     if (-not $Watcher.Async) { $Watcher.Cancel.Dispose(); return $true }
     $done = $Watcher.Async.AsyncWaitHandle.WaitOne(2000)
     if (-not $done) {
-        try { $stop=$Watcher.PowerShell.BeginStop($null,$null); $done=$stop.AsyncWaitHandle.WaitOne(500) } catch {}
+        try { $stop=$Watcher.PowerShell.BeginStop($null,$null); $done=$stop.AsyncWaitHandle.WaitOne(500) } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Stop-SnifferPrintWatcher / catch at line 229' -ErrorRecord $_; }
     }
     $done=$done -and $Watcher.Async.IsCompleted
     if ($done) {
-        try { $null=$Watcher.PowerShell.EndInvoke($Watcher.Async) } catch {}
+        try { $null=$Watcher.PowerShell.EndInvoke($Watcher.Async) } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Stop-SnifferPrintWatcher / catch at line 233' -ErrorRecord $_; }
         $Watcher.PowerShell.Dispose(); $Watcher.Runspace.Dispose(); $Watcher.Cancel.Dispose()
     } else { $script:PendingPrinterWatchers.Add($Watcher) }
     return $done
@@ -294,7 +403,7 @@ function Write-SnifferPrintSummary {
 
 function Get-SnifferTargets {
     $ports = @{}
-    try { Get-PrinterPort -ErrorAction Stop | ForEach-Object { $ports[$_.Name] = $_ } } catch {}
+    try { Get-PrinterPort -ErrorAction Stop | ForEach-Object { $ports[$_.Name] = $_ } } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Get-SnifferTargets / catch at line 297' -ErrorRecord $_; }
     try {
         foreach ($printer in @(Get-Printer -Full -ErrorAction Stop | Sort-Object Name)) {
             $port = $ports[$printer.PortName]
@@ -313,10 +422,10 @@ function Get-SnifferTargets {
                     $networkFound=$true
                     [PSCustomObject]@{ Name=$printer.Name; IP=$ipv4.ToString(); Port=$printer.PortName; CapturePort=$port.PortNumber; CaptureNetwork=$true; ConnectionType='LAN' }
                 }
-            } catch { Write-Host "Не удалось определить адрес [$($printer.Name)]: $address" -ForegroundColor DarkYellow }
+            } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Get-SnifferTargets / catch at line 316' -ErrorRecord $_;  Write-Host "Не удалось определить адрес [$($printer.Name)]: $address" -ForegroundColor DarkYellow }
             if(-not $networkFound){[PSCustomObject]@{Name=$printer.Name;IP='';Port=$printer.PortName;CapturePort=0;CaptureNetwork=$false;ConnectionType='Очередь Windows; IPv4 не определён'}}
         }
-    } catch { Write-Host 'Список принтеров недоступен. Можно ввести IPv4 вручную.' -ForegroundColor Yellow }
+    } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Get-SnifferTargets / catch at line 319' -ErrorRecord $_;  Write-Host 'Список принтеров недоступен. Можно ввести IPv4 вручную.' -ForegroundColor Yellow }
 }
 
 function Get-SnifferLocalAddress {
@@ -334,7 +443,7 @@ function Add-SnifferSnapshotSection {
     try {
         $values = @(& $Read)
         $Data[$Name] = ConvertTo-Json -InputObject $values -Depth 5 -Compress
-    } catch { $Data[$Name] = '[НЕ УДАЛОСЬ ПРОЧИТАТЬ] ' + $_.Exception.Message }
+    } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Add-SnifferSnapshotSection / catch at line 337' -ErrorRecord $_;  $Data[$Name] = '[НЕ УДАЛОСЬ ПРОЧИТАТЬ] ' + $_.Exception.Message }
 }
 
 function Get-SnifferSnapshot {
@@ -354,7 +463,7 @@ function Get-SnifferSnapshot {
                 Shared=$printer.Shared; ShareName=$printer.ShareName; Type=[string]$printer.Type
             } | ConvertTo-Json -Compress
         }
-    } catch { $data['Принтеры/ошибка'] = $_.Exception.Message }
+    } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Get-SnifferSnapshot / catch at line 357' -ErrorRecord $_;  $data['Принтеры/ошибка'] = $_.Exception.Message }
     Add-SnifferSnapshotSection $data 'Порты печати' {
         Get-PrinterPort -ErrorAction Stop | Sort-Object Name |
             Select-Object Name, Description, PortMonitor, PrinterHostAddress, PortNumber, Protocol, SNMPEnabled
@@ -513,7 +622,7 @@ function Write-SnifferPrintEvents {
                 $Writer.WriteLine($event.Message)
             }
             if ($events.Count -eq 1000) { $Writer.WriteLine('Достигнут лимит 1000 событий: журнал в отчёте может быть неполным.') }
-        } catch {
+        } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Write-SnifferPrintEvents / catch at line 516' -ErrorRecord $_; 
             if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $Writer.WriteLine('Событий за интервал не найдено.') }
             else { $Writer.WriteLine('Не удалось прочитать журнал: '+$_.Exception.Message) }
         }
@@ -530,7 +639,7 @@ function Write-SnifferPrintEvents {
                 $Writer.WriteLine($event.Message)
             }
             if ($events.Count -eq 1000) { $Writer.WriteLine('Достигнут лимит чтения 1000 событий; часть событий могла не попасть в отчёт.') }
-        } catch { $Writer.WriteLine('События отсутствуют или недоступны: '+$_.Exception.Message) }
+        } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Write-SnifferPrintEvents / catch at line 533' -ErrorRecord $_;  $Writer.WriteLine('События отсутствуют или недоступны: '+$_.Exception.Message) }
     }
 }
 
@@ -655,7 +764,7 @@ function Start-PrinterSnifferSession {
         Write-SnifferChanges $writer $before $after
         Write-SnifferPrintEvents $writer $started $ended
         $completed = $true
-    } catch {
+    } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Start-PrinterSnifferSession / catch at line 658' -ErrorRecord $_; 
         $failure = $_.Exception.Message
         $writer.WriteLine("`r`nОШИБКА ЗАПИСИ: $failure")
     } finally {
@@ -681,7 +790,7 @@ try {
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
         try {
             Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -Verb RunAs -WindowStyle Normal -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded) -ErrorAction Stop | Out-Null
-        } catch { Write-Host 'Нужны права администратора. Запись не запущена.' -ForegroundColor Yellow; $null = Read-Host 'Enter — выход' }
+        } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Main / catch at line 684' -ErrorRecord $_;  Write-Host 'Нужны права администратора. Запись не запущена.' -ForegroundColor Yellow; $null = Read-Host 'Enter — выход' }
         return
     }
     $Host.UI.RawUI.WindowTitle = 'Scriptonite — Сниффер принтера'
@@ -717,10 +826,10 @@ try {
             if ($result.Completed) { Write-Host "`nГОТОВО. Отчёт сохранён." -ForegroundColor Green }
             else { Write-Host "Отчёт неполный: $($result.Error)" -ForegroundColor Yellow }
             Write-Host "TXT: $($result.Path)" -ForegroundColor Cyan
-        } catch { Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red }
+        } catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Main / catch at line 720' -ErrorRecord $_;  Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red }
         $null = Read-Host 'Enter — вернуться к выбору'
     }
-} catch {
+} catch { Write-ScriptoniteError -Context 'printer-sniffer.ps1 / Main / catch at line 723' -ErrorRecord $_; 
     Write-Host "Не удалось открыть сниффер: $($_.Exception.Message)" -ForegroundColor Red
     $null = Read-Host 'Enter — выход'
 }

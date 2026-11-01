@@ -2,8 +2,68 @@
 param(
     [int]$InterfaceIndex = 0,
     [ValidateRange(1, 3600)][int]$IntervalSeconds = 30,
-    [ValidateRange(10, 86400)][int]$QuietSeconds = 90
+    [ValidateRange(10, 86400)][int]$QuietSeconds = 90,
+    [string]$OutputDirectory
 )
+
+# BEGIN SCRIPTONITE ERROR LOGGING
+function Write-ScriptoniteError {
+    param([string]$Context='Script execution', $ErrorRecord, [string]$Message)
+    # No events and an intentional Ctrl+C are normal outcomes, not failures.
+    if($ErrorRecord -and ($ErrorRecord.FullyQualifiedErrorId -like 'NoMatchingEventsFound*' -or $ErrorRecord.Exception -is [System.Management.Automation.PipelineStoppedException])){return}
+    $state=$script:ScriptoniteErrorLog
+    if(-not $state){return}
+    $locked=$false
+    try{
+        [Threading.Monitor]::Enter($state.SyncRoot);$locked=$true
+        $detail=$Message
+        if($ErrorRecord){
+            $detail=($ErrorRecord | Out-String -Width 240).Trim()
+            $detail+=[Environment]::NewLine+'Error ID: '+$ErrorRecord.FullyQualifiedErrorId
+            $detail+=[Environment]::NewLine+'Exception: '+$ErrorRecord.Exception.ToString()
+            $detail+=[Environment]::NewLine+'Location: '+$ErrorRecord.InvocationInfo.PositionMessage
+            $detail+=[Environment]::NewLine+'Stack: '+$ErrorRecord.ScriptStackTrace
+        }
+        $key=$Context+'|'+$detail
+        $now=[DateTime]::UtcNow
+        # Preserve the first failure and repeated failures at most once a minute.
+        if($state.Recent.ContainsKey($key) -and ($now-$state.Recent[$key]).TotalSeconds -lt 60){return}
+        $line=$now.ToString('o')+' ['+$state.Script+'] ['+$Context+']'+[Environment]::NewLine+$detail+[Environment]::NewLine+[Environment]::NewLine
+        $paths=@()
+        if($state.Path){$paths+=$state.Path}
+        foreach($directory in $state.Directories){if($directory){$paths+=[IO.Path]::Combine($directory,$state.Name)}}
+        foreach($path in @($paths | Select-Object -Unique)){
+            try{
+                $fullPath=[IO.Path]::GetFullPath($path)
+                $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fullPath))
+                $encoding=New-Object Text.UTF8Encoding($true)
+                if(-not [IO.File]::Exists($fullPath)){
+                    $header='SCRIPTONITE - SCRIPT EXECUTION ERRORS'+[Environment]::NewLine+'Script: '+$state.Script+[Environment]::NewLine+'PowerShell: '+$PSVersionTable.PSVersion+[Environment]::NewLine
+                    [IO.File]::WriteAllText($fullPath,$header,$encoding)
+                }
+                [IO.File]::AppendAllText($fullPath,$line,$encoding)
+                if($state.Path -ne $fullPath){Write-Host ('Error log: '+$fullPath) -ForegroundColor Yellow}
+                $state.Path=$fullPath
+                if($state.Recent.Count -gt 512){$state.Recent.Clear()}
+                $state.Recent[$key]=$now
+                return
+            }catch{ }
+        }
+        if(-not $state.Failed){Write-Host 'Could not save the error log beside the script or on Desktop.' -ForegroundColor Red;$state.Failed=$true}
+    }catch{ }
+    finally{if($locked){[Threading.Monitor]::Exit($state.SyncRoot)}}
+}
+$errorDirectory=$OutputDirectory
+if(-not $errorDirectory -and $env:SCRIPTONITE_SOURCE){$errorDirectory=[IO.Path]::GetDirectoryName($env:SCRIPTONITE_SOURCE)}
+if(-not $errorDirectory -and $PSScriptRoot -and $PSScriptRoot -notmatch '[\\/]Scriptonite[\\/](scripts|launcher)([\\/]|$)'){$errorDirectory=$PSScriptRoot}
+if(-not $errorDirectory){$errorDirectory=[Environment]::GetFolderPath('Desktop')}
+$script:ScriptoniteErrorLog=@{
+    Script='network-monitor';Path='';Failed=$false;Recent=@{};SyncRoot=(New-Object object)
+    Directories=@($errorDirectory,[Environment]::GetFolderPath('Desktop') | Where-Object {$_} | Select-Object -Unique)
+    Name=('ScriptoniteErrors_network-monitor_{0}_{1}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'),[guid]::NewGuid().ToString('N').Substring(0,6))
+}
+trap { Write-ScriptoniteError -Context 'Unhandled script error' -ErrorRecord $_; break }
+# END SCRIPTONITE ERROR LOGGING
 
 $ErrorActionPreference = 'Stop'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -65,7 +125,7 @@ namespace ScriptoniteNetwork {
 '@ -Language CSharp
         }
         return New-Object ScriptoniteNetwork.ConsoleInputGuard
-    } catch { Write-Verbose ('Не удалось отключить быстрое выделение: '+$_.Exception.Message) }
+    } catch { Write-ScriptoniteError -Context 'network-monitor.ps1 / Start-NetworkConsoleGuard / catch at line 69' -ErrorRecord $_;  Write-Verbose ('Не удалось отключить быстрое выделение: '+$_.Exception.Message) }
 }
 
 function Add-Event([string]$Message, [string]$Color = 'Yellow') {
@@ -193,7 +253,7 @@ try {
             try {
                 $task = $ping.SendPingAsync($ip, 1000)
                 $pendingPings += [PSCustomObject]@{ IP = $ip; Ping = $ping; Task = $task }
-            } catch { $ping.Dispose(); throw }
+            } catch { Write-ScriptoniteError -Context 'network-monitor.ps1 / Main / catch at line 197' -ErrorRecord $_;  $ping.Dispose(); throw }
         }
         while (@($pendingPings | Where-Object { -not $_.Task.IsCompleted }).Count -gt 0) {
             Read-Traffic
@@ -205,7 +265,7 @@ try {
                 if ($request.Task.GetAwaiter().GetResult().Status -eq 'Success') {
                     $currentPing[$request.IP] = [PSCustomObject]@{ IP = $request.IP; Статус = 'Ping' }
                 }
-            } catch {} finally { $request.Ping.Dispose() }
+            } catch { Write-ScriptoniteError -Context 'network-monitor.ps1 / Main / catch at line 209' -ErrorRecord $_; } finally { $request.Ping.Dispose() }
         }
         $pendingPings = @()
         Read-Traffic
@@ -320,7 +380,7 @@ try {
             Start-Sleep -Milliseconds 50
         }
     }
-} catch {
+} catch { Write-ScriptoniteError -Context 'network-monitor.ps1 / Main / catch at line 324' -ErrorRecord $_; 
     Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
 } finally {
     if ($consoleGuard) { $consoleGuard.Dispose() }

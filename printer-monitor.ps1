@@ -1,8 +1,68 @@
 ﻿[CmdletBinding()]
 param(
     [ValidateRange(1, 3600)][int]$IntervalSeconds = 30,
-    [switch]$Once
+    [switch]$Once,
+    [string]$OutputDirectory
 )
+
+# BEGIN SCRIPTONITE ERROR LOGGING
+function Write-ScriptoniteError {
+    param([string]$Context='Script execution', $ErrorRecord, [string]$Message)
+    # No events and an intentional Ctrl+C are normal outcomes, not failures.
+    if($ErrorRecord -and ($ErrorRecord.FullyQualifiedErrorId -like 'NoMatchingEventsFound*' -or $ErrorRecord.Exception -is [System.Management.Automation.PipelineStoppedException])){return}
+    $state=$script:ScriptoniteErrorLog
+    if(-not $state){return}
+    $locked=$false
+    try{
+        [Threading.Monitor]::Enter($state.SyncRoot);$locked=$true
+        $detail=$Message
+        if($ErrorRecord){
+            $detail=($ErrorRecord | Out-String -Width 240).Trim()
+            $detail+=[Environment]::NewLine+'Error ID: '+$ErrorRecord.FullyQualifiedErrorId
+            $detail+=[Environment]::NewLine+'Exception: '+$ErrorRecord.Exception.ToString()
+            $detail+=[Environment]::NewLine+'Location: '+$ErrorRecord.InvocationInfo.PositionMessage
+            $detail+=[Environment]::NewLine+'Stack: '+$ErrorRecord.ScriptStackTrace
+        }
+        $key=$Context+'|'+$detail
+        $now=[DateTime]::UtcNow
+        # Preserve the first failure and repeated failures at most once a minute.
+        if($state.Recent.ContainsKey($key) -and ($now-$state.Recent[$key]).TotalSeconds -lt 60){return}
+        $line=$now.ToString('o')+' ['+$state.Script+'] ['+$Context+']'+[Environment]::NewLine+$detail+[Environment]::NewLine+[Environment]::NewLine
+        $paths=@()
+        if($state.Path){$paths+=$state.Path}
+        foreach($directory in $state.Directories){if($directory){$paths+=[IO.Path]::Combine($directory,$state.Name)}}
+        foreach($path in @($paths | Select-Object -Unique)){
+            try{
+                $fullPath=[IO.Path]::GetFullPath($path)
+                $null=[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($fullPath))
+                $encoding=New-Object Text.UTF8Encoding($true)
+                if(-not [IO.File]::Exists($fullPath)){
+                    $header='SCRIPTONITE - SCRIPT EXECUTION ERRORS'+[Environment]::NewLine+'Script: '+$state.Script+[Environment]::NewLine+'PowerShell: '+$PSVersionTable.PSVersion+[Environment]::NewLine
+                    [IO.File]::WriteAllText($fullPath,$header,$encoding)
+                }
+                [IO.File]::AppendAllText($fullPath,$line,$encoding)
+                if($state.Path -ne $fullPath){Write-Host ('Error log: '+$fullPath) -ForegroundColor Yellow}
+                $state.Path=$fullPath
+                if($state.Recent.Count -gt 512){$state.Recent.Clear()}
+                $state.Recent[$key]=$now
+                return
+            }catch{ }
+        }
+        if(-not $state.Failed){Write-Host 'Could not save the error log beside the script or on Desktop.' -ForegroundColor Red;$state.Failed=$true}
+    }catch{ }
+    finally{if($locked){[Threading.Monitor]::Exit($state.SyncRoot)}}
+}
+$errorDirectory=$OutputDirectory
+if(-not $errorDirectory -and $env:SCRIPTONITE_SOURCE){$errorDirectory=[IO.Path]::GetDirectoryName($env:SCRIPTONITE_SOURCE)}
+if(-not $errorDirectory -and $PSScriptRoot -and $PSScriptRoot -notmatch '[\\/]Scriptonite[\\/](scripts|launcher)([\\/]|$)'){$errorDirectory=$PSScriptRoot}
+if(-not $errorDirectory){$errorDirectory=[Environment]::GetFolderPath('Desktop')}
+$script:ScriptoniteErrorLog=@{
+    Script='printer-monitor';Path='';Failed=$false;Recent=@{};SyncRoot=(New-Object object)
+    Directories=@($errorDirectory,[Environment]::GetFolderPath('Desktop') | Where-Object {$_} | Select-Object -Unique)
+    Name=('ScriptoniteErrors_printer-monitor_{0}_{1}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'),[guid]::NewGuid().ToString('N').Substring(0,6))
+}
+trap { Write-ScriptoniteError -Context 'Unhandled script error' -ErrorRecord $_; break }
+# END SCRIPTONITE ERROR LOGGING
 
 $ErrorActionPreference = 'Stop'
 
@@ -136,10 +196,10 @@ function Get-PrinterSnapshot {
     $printers = @(Get-Printer -ErrorAction Stop | Sort-Object Name)
     $wmi = @{}
     Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status 'Читаю состояние устройств Windows (WMI)...' -PercentComplete -1
-    try { Get-CimInstance -ClassName Win32_Printer -OperationTimeoutSec 10 -ErrorAction Stop | ForEach-Object { $wmi[$_.Name] = $_ } } catch {}
+    try { Get-CimInstance -ClassName Win32_Printer -OperationTimeoutSec 10 -ErrorAction Stop | ForEach-Object { $wmi[$_.Name] = $_ } } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Get-PrinterSnapshot / catch at line 140' -ErrorRecord $_; }
     $ports = @{}
     Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status 'Читаю порты печати...' -PercentComplete -1
-    try { Get-PrinterPort -ErrorAction Stop | ForEach-Object { $ports[$_.Name] = $_ } } catch {}
+    try { Get-PrinterPort -ErrorAction Stop | ForEach-Object { $ports[$_.Name] = $_ } } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Get-PrinterSnapshot / catch at line 143' -ErrorRecord $_; }
     Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status 'Проверяю доступность сетевых портов...' -PercentComplete -1
     $tcpChecks = Get-PrinterTcpChecks $ports
     $presentIds = @{}
@@ -149,7 +209,7 @@ function Get-PrinterSnapshot {
         try {
             Get-PnpDevice -PresentOnly -ErrorAction Stop | ForEach-Object { $presentIds[$_.InstanceId] = $true }
             $presenceAvailable = $true
-        } catch {}
+        } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Get-PrinterSnapshot / catch at line 153' -ErrorRecord $_; }
     }
     $number = 0
     foreach ($printer in $printers) {
@@ -166,7 +226,7 @@ function Get-PrinterSnapshot {
         }
         $queueCount = $null
         $jobsError = ''
-        try { $queueCount = @(Get-PrintJob -PrinterName $printer.Name -ErrorAction Stop).Count } catch { $jobsError = $_.Exception.Message }
+        try { $queueCount = @(Get-PrintJob -PrinterName $printer.Name -ErrorAction Stop).Count } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Get-PrinterSnapshot / catch at line 170' -ErrorRecord $_;  $jobsError = $_.Exception.Message }
         $portInfo = New-Object 'System.Collections.Generic.List[string]'
         $networkStates = New-Object 'System.Collections.Generic.List[string]'
         $names = if ($ports.ContainsKey($printer.PortName)) { @($printer.PortName) } else { @($printer.PortName -split ',\s*') }
@@ -201,10 +261,10 @@ function Clear-SelectedPrinterQueue {
     $failures = New-Object 'System.Collections.Generic.List[string]'
     foreach ($job in $jobs) {
         try { Remove-PrintJob -InputObject $job -Confirm:$false -ErrorAction Stop; $removed++ }
-        catch { $failures.Add("Задание $($job.ID): $($_.Exception.Message)") }
+        catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Clear-SelectedPrinterQueue / catch at line 205' -ErrorRecord $_;  $failures.Add("Задание $($job.ID): $($_.Exception.Message)") }
     }
     $remaining = '?'
-    try { $remaining = @(Get-PrintJob -PrinterName $Name -ErrorAction Stop).Count } catch {}
+    try { $remaining = @(Get-PrintJob -PrinterName $Name -ErrorAction Stop).Count } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Clear-SelectedPrinterQueue / catch at line 208' -ErrorRecord $_; }
     $message = "[$Name] Запрошено удаление $removed из $($jobs.Count) заданий. Осталось в очереди: $remaining."
     if ($failures.Count) { $message += " Ошибки: $($failures -join '; ')" }
     return $message
@@ -301,7 +361,7 @@ function Invoke-PrinterRecoveryStep {
         $detail = @(& $Action) -join "`n"
         if ($detail) { Write-Host $detail -ForegroundColor Green }
         return [PSCustomObject]@{ Success=$true; Title=$Title; Detail=$detail }
-    } catch {
+    } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Invoke-PrinterRecoveryStep / catch at line 305' -ErrorRecord $_; 
         $detail = $_.Exception.Message
         Write-Host $detail -ForegroundColor Red
         return [PSCustomObject]@{ Success=$false; Title=$Title; Detail=$detail }
@@ -324,7 +384,7 @@ function Get-SelectedPrinterLanTarget {
 
 function New-PrinterSnmpClient {
     try { return New-Object -ComObject OlePrn.OleSNMP -ErrorAction Stop }
-    catch { throw 'В Windows недоступен компонент OlePrn.OleSNMP. Для этой версии используйте веб-интерфейс или фирменную утилиту принтера.' }
+    catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / New-PrinterSnmpClient / catch at line 328' -ErrorRecord $_;  throw 'В Windows недоступен компонент OlePrn.OleSNMP. Для этой версии используйте веб-интерфейс или фирменную утилиту принтера.' }
 }
 
 function Get-PrinterResetOids {
@@ -364,12 +424,12 @@ function Invoke-PrinterLanReset {
         # Zero retries: a timed-out write must not silently repeat a reset.
         $null = $client.Open($target.Address, $community, 0, 1000)
         $description = ''
-        try { $description = [string]$client.Get('.1.3.6.1.2.1.1.1.0') } catch {}
+        try { $description = [string]$client.Get('.1.3.6.1.2.1.1.1.0') } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Invoke-PrinterLanReset / catch at line 368' -ErrorRecord $_; }
         if ($description) { Write-Host "Ответ устройства: $description" -ForegroundColor Cyan }
         try {
             $tree = $client.GetTree('.1.3.6.1.2.1.43.5.1.1.3')
             $oids = @(Get-PrinterResetOids $tree)
-        } catch { throw 'Объект SNMP-сброса не получен: возможны отсутствие поддержки, закрытый UDP 161 или неподходящая community. Команда сброса не отправлялась.' }
+        } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Invoke-PrinterLanReset / catch at line 373' -ErrorRecord $_;  throw 'Объект SNMP-сброса не получен: возможны отсутствие поддержки, закрытый UDP 161 или неподходящая community. Команда сброса не отправлялась.' }
         if (-not $oids.Count) { throw 'Принтер не предоставил prtGeneralReset. Непроверенные команды Xprinter/Rongta не отправляются; нужен способ для конкретной модели.' }
         $oid = $oids[0]
         if ($oids.Count -gt 1) {
@@ -404,11 +464,11 @@ function Invoke-PrinterLanReset {
             throw 'Адрес, драйвер или порт изменились во время проверки. Сброс отменён.'
         }
         try { $null = $client.Set($oid, [int]$value) }
-        catch { throw 'Подтверждение SNMP SET не получено. Возможны отказ в записи, неподдерживаемая операция или потеря ответа при сбросе. Результат неизвестен; автоматический повтор не выполняется.' }
+        catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Invoke-PrinterLanReset / catch at line 408' -ErrorRecord $_;  throw 'Подтверждение SNMP SET не получено. Возможны отказ в записи, неподдерживаемая операция или потеря ответа при сбросе. Результат неизвестен; автоматический повтор не выполняется.' }
         return "[$Name / $($target.Address)] Получено подтверждение SNMP-команды сброса. Завершение перезапуска и готовность к печати ещё не проверены."
     } finally {
         if ($client) {
-            try { $null = $client.Close() } catch {}
+            try { $null = $client.Close() } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Invoke-PrinterLanReset / catch at line 412' -ErrorRecord $_; }
             if ([Runtime.InteropServices.Marshal]::IsComObject($client)) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($client) }
         }
         if ($pointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
@@ -436,13 +496,13 @@ function Invoke-ExperimentalPrinterRecovery {
     try {
         Get-PnpDevice -PresentOnly -ErrorAction Stop | ForEach-Object { $present[$_.InstanceId] = $true }
         $presenceAvailable = $true
-    } catch {}
+    } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Invoke-ExperimentalPrinterRecovery / catch at line 440' -ErrorRecord $_; }
     $hardware = Get-PrinterHardware $original $wmi $present $presenceAvailable
     $usbId = ''
     $lanTarget = $null
     # An explicit TCP/IP queue port takes precedence over any stale USB PnP
     # association, even if that printer is also physically attached over USB.
-    try { $lanTarget = Get-SelectedPrinterLanTarget $Name } catch {}
+    try { $lanTarget = Get-SelectedPrinterLanTarget $Name } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Invoke-ExperimentalPrinterRecovery / catch at line 446' -ErrorRecord $_; }
     if (-not $lanTarget -and $hardware.Present -eq $true -and $hardware.PhysicalId -match '^USBPRINT\\|^USB\\VID_') { $usbId = $hardware.PhysicalId }
 
     Write-Host "`nЭКСПЕРИМЕНТАЛЬНОЕ ВОССТАНОВЛЕНИЕ: $Name" -ForegroundColor Yellow
@@ -688,9 +748,9 @@ try {
                 '8' { $message = Invoke-ExperimentalPrinterRecovery $selected.Name; $null = Read-Host 'Enter — вернуться к меню принтера' }
                 default { $message = 'Неизвестная команда.' }
             }
-        } catch { $message = "Ошибка: $($_.Exception.Message)" }
+        } catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Main / catch at line 692' -ErrorRecord $_;  $message = "Ошибка: $($_.Exception.Message)" }
     }
-} catch {
+} catch { Write-ScriptoniteError -Context 'printer-monitor.ps1 / Main / catch at line 694' -ErrorRecord $_; 
     Write-Host "Не удалось открыть монитор принтеров: $($_.Exception.Message)" -ForegroundColor Red
     if ($Once) { throw }
     $null = Read-Host 'Нажмите Enter для выхода'
