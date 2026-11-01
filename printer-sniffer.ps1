@@ -603,8 +603,6 @@ function Start-PrinterSnifferSession {
         Write-Host '[0] СТОП — также можно нажать Enter или Esc' -ForegroundColor Yellow
         Write-Host 'Теперь меняйте настройки, переустанавливайте драйвер или запускайте печать.'
         Write-Host 'Приход заданий, ошибки и завершение Windows появятся ниже и сохранятся в TXT.' -ForegroundColor Cyan
-        $clock = [Diagnostics.Stopwatch]::StartNew()
-        $lastDisplay = -1
         while ($true) {
             if (Test-PrinterSnifferStop) { break }
             Receive-SnifferPrintMessages $watcher $live $writer
@@ -639,25 +637,8 @@ function Start-PrinterSnifferSession {
                 }
             }elseif(-not $socket){Start-Sleep -Milliseconds 100}
             if ($writer.BaseStream.Length -ge ([int64]$LimitMegabytes*1MB)) { $reason = 'Достигнут лимит размера TXT'; break }
-            $second = [int]$clock.Elapsed.TotalSeconds
-            if ($second -ne $lastDisplay -and $second % 5 -eq 0) {
-                Write-Host "Идёт запись: $second с | [0] Стоп" -ForegroundColor DarkGray
-                if($networkCapture){Write-Host "IPv4-пакетов: $packets | IP-байт: $bytes" -ForegroundColor DarkGray}
-                $queueText=if($null -eq $live.QueueCount){'неизвестно'}else{[string]$live.QueueCount}
-                Write-Host "Документов сейчас в очереди: $queueText | Заданий замечено: $($live.JobsSeen) | Уведомлений о поступлении: $($live.Arrivals)" -ForegroundColor Yellow
-                $dataText=if($live.LastPrint -eq [datetime]::MinValue){'пока не замечены'}elseif(((Get-Date)-$live.LastPrint).TotalSeconds -lt 3){'ИДЁТ ПЕРЕДАЧА'}else{'передавались; последнее наблюдение '+$live.LastPrint.ToString('HH:mm:ss')}
-                if($networkCapture){Write-Host "Данные на печатный порт: $dataText"}
-                $receiptText=if($live.SawJobs){'ДА — задания в выбранной очереди зафиксированы'}else{'пока не замечены'}
-                Write-Host "Задания Windows: $receiptText" -ForegroundColor $(if($live.SawJobs){'Green'}else{'DarkGray'})
-                $resultText=if($live.Errors -gt 0){"За время записи были ошибки заданий: $($live.Errors). Смотрите события выше."}elseif($live.WindowsReported){'Windows сообщала о завершении; бумага не подтверждена'}else{'завершение печати пока не подтверждено'}
-                $resultColor=if($live.Errors -gt 0){'Red'}elseif($live.WindowsReported){'Green'}else{'DarkGray'}
-                Write-Host "Результат наблюдения: $resultText" -ForegroundColor $resultColor
-                if($live.LastJob){Write-Host ('Последнее: '+$live.LastJob) -ForegroundColor $(if($live.LastJob -like 'ОШИБКА:*'){'Red'}else{'DarkGray'})}
-                $lastDisplay = $second
-            }
         }
         $ended = Get-Date
-        $clock.Stop()
         if($socket){$socket.Close(); $socket=$null}
         $watcherDone = Stop-SnifferPrintWatcher $watcher
         $watcherStopped = $true
