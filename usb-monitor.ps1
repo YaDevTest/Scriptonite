@@ -269,6 +269,89 @@ function Merge-UsbConnectors {
     }
 }
 
+function ConvertTo-UsbInstanceId {
+    param([string]$Value)
+    $value=$Value.Trim().Trim([char]0)
+    # USB Monitor can store either a PnP instance ID or a device-interface path.
+    $value=$value -replace '^\\\\\?\\','' -replace '^\\\?\?\\',''
+    $value=$value -replace '#\{[0-9A-Fa-f-]+\}.*$',''
+    $value=$value.Replace('#','\')
+    if($value -match '^(USBPRINT|USB)\\' -and $value -notmatch '^USB\\ROOT_HUB'){return $value}
+    return ''
+}
+
+function Get-UsbPrinterBindings {
+    param([object[]]$Connectors)
+    $warnings=New-Object 'System.Collections.Generic.List[string]'
+    $names=@{};$queues=@{};$queueRead=$false
+    $registryRoot='Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Print\Monitors\USB Monitor\Ports'
+    try{foreach($key in @(Get-ChildItem -LiteralPath $registryRoot -ErrorAction Stop)){if($key.PSChildName -match '^USB[0-9]+$'){$names[$key.PSChildName]=$true}}}
+    catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){$warnings.Add('Не удалось перечислить привязки USB Monitor: '+$_.Exception.Message)}}
+    try{foreach($port in @(Get-PrinterPort -ErrorAction Stop)){if($port.Name -match '^USB[0-9]+$'){$names[$port.Name]=$true}}}
+    catch{$warnings.Add('Не удалось прочитать список портов печати: '+$_.Exception.Message)}
+    try{
+        foreach($printer in @(Get-Printer -ErrorAction Stop)){
+            foreach($portName in @($printer.PortName -split ',\s*')){
+                if($portName -notmatch '^USB[0-9]+$'){continue}
+                $names[$portName]=$true
+                if(!$queues.ContainsKey($portName)){$queues[$portName]=New-Object 'System.Collections.Generic.List[string]'}
+                $queues[$portName].Add([string]$printer.Name)
+            }
+        }
+        $queueRead=$true
+    }catch{$warnings.Add('Не удалось прочитать очереди печати: '+$_.Exception.Message)}
+    $byInstance=@{}
+    foreach($connector in $Connectors){
+        if($connector.InstanceId -and $connector.Status -gt 0){
+            if(!$byInstance.ContainsKey($connector.InstanceId)){$byInstance[$connector.InstanceId]=New-Object 'System.Collections.Generic.List[object]'}
+            $byInstance[$connector.InstanceId].Add($connector)
+        }
+    }
+    $parentCache=@{};$propertyApi=[bool](Get-Command Get-PnpDeviceProperty -ErrorAction SilentlyContinue)
+    $rows=New-Object 'System.Collections.Generic.List[object]'
+    foreach($name in @($names.Keys | Sort-Object)){
+        $deviceId='';$readError=''
+        try{
+            $data=Get-ItemProperty -LiteralPath ($registryRoot+'\'+$name) -ErrorAction Stop
+            # Only device identity fields; Parent Device Id may name a root hub.
+            foreach($field in @('Device Id','DeviceID','DeviceInstanceId','PnPDeviceID','Device Path')){
+                $value=$data.PSObject.Properties[$field]
+                if($value -and $value.Value -is [string]){$deviceId=ConvertTo-UsbInstanceId $value.Value;if($deviceId){break}}
+            }
+        }catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){$readError=$_.Exception.Message}}
+        $chain=New-Object 'System.Collections.Generic.List[string]'
+        $id=$deviceId;$match=$null;$vidPid='-';$viaHub=$false
+        for($depth=0;$id -and $depth -lt 32;$depth++){
+            if($chain.Contains($id)){break}
+            if($id -match '^USB\\ROOT_HUB|^PCI\\|^HTREE\\'){break}
+            $chain.Add($id)
+            if($vidPid -eq '-' -and $id -match 'VID_([0-9A-F]{4}).*PID_([0-9A-F]{4})'){$vidPid=$Matches[1]+':'+$Matches[2]}
+            if($byInstance.ContainsKey($id)){
+                if($byInstance[$id].Count -eq 1){$match=$byInstance[$id][0];$viaHub=($chain.Count -gt 1 -and $match.Device -match 'hub|концентратор')}
+                break
+            }
+            if(!$propertyApi){break}
+            if(!$parentCache.ContainsKey($id)){
+                $parent=''
+                try{$prop=Get-PnpDeviceProperty -InstanceId $id -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop | Where-Object InstanceId -eq $id | Select-Object -First 1;$parent=[string]$prop.Data}catch{}
+                $parentCache[$id]=$parent
+            }
+            $id=$parentCache[$id]
+        }
+        $physical='Не сопоставлен';$state='Текущий разъём не подтверждён';$device='-'
+        if($match){
+            $physical='USB '+$match.Number
+            if($viaHub){$physical+=' (через хаб)'}
+            $device=$match.Device
+            $state=if($match.Status -eq 1){'Устройство подключено'}else{'Ошибка USB: '+$match.Status}
+        }elseif(!$deviceId){$state=if($readError){'Привязка недоступна'}else{'Нет идентификатора в USB Monitor'}}
+        $queue=if(!$queueRead){'Не удалось прочитать'}elseif($queues.ContainsKey($name)){($queues[$name] | Sort-Object) -join '; '}else{'Нет очередей'}
+        $rows.Add([pscustomobject]@{LogicalPort=$name;Queues=$queue;PhysicalPort=$physical;Device=$device;VidPid=$vidPid;State=$state;DeviceId=$deviceId;PhysicalKey=$(if($match){$match.Key}else{''})})
+        if($readError){$warnings.Add("$name : $readError")}
+    }
+    return [pscustomobject]@{Rows=$rows.ToArray();Warnings=$warnings.ToArray()}
+}
+
 function Get-UsbPortChanges {
     param([hashtable]$Previous, [hashtable]$Current)
     foreach ($key in $Current.Keys) {
@@ -328,6 +411,16 @@ try {
         })
         if ($rows.Count) { Write-Host ($rows | Format-Table -AutoSize -Wrap | Out-String -Width ([Math]::Max(60, $Host.UI.RawUI.WindowSize.Width - 1))) }
         else { Write-Host 'На подтверждённых внешних разъёмах устройств не обнаружено.' }
+        Write-Host 'ПОРТЫ ПЕЧАТИ USB — СОПОСТАВЛЕНИЕ С РАЗЪЁМАМИ:' -ForegroundColor Cyan
+        Write-Progress -Id 34 -Activity 'Сопоставление USB-портов печати' -Status 'Читаю порты, очереди и идентификаторы устройств...' -PercentComplete -1
+        try{$bindings=Get-UsbPrinterBindings $connectors}
+        finally{Write-Progress -Id 34 -Activity 'Сопоставление USB-портов печати' -Completed}
+        if($bindings.Rows.Count){
+            $bindingRows=@($bindings.Rows | ForEach-Object {[pscustomobject]@{'Логический порт'=$_.LogicalPort;'Очереди печати'=$_.Queues;'Физический разъём'=$_.PhysicalPort;'VID:PID'=$_.VidPid;'Устройство'=$_.Device;'Состояние'=$_.State}})
+            Write-Host ($bindingRows | Format-Table -Wrap | Out-String -Width ([Math]::Max(80,$Host.UI.RawUI.WindowSize.Width-1)))
+        }else{Write-Host 'USB-портов печати в доступных данных Windows не найдено.' -ForegroundColor DarkGray}
+        foreach($warning in $bindings.Warnings){Write-Host $warning -ForegroundColor Yellow}
+        Write-Host 'Сопоставление — по Instance ID и родителям PnP. «Не сопоставлен» не означает, что разъём пуст.' -ForegroundColor DarkGray
         if (-not $complete -or $connectors.Count -eq 0) {
             Write-Host 'Данные о разъёмах неполные. Число выше не гарантирует полный подсчёт портов; события отключения не формируются.' -ForegroundColor Yellow
             if ($missingMetadata) { Write-Host "Не удалось определить назначение $missingMetadata логических портов." -ForegroundColor Yellow }
