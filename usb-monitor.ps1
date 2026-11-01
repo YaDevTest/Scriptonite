@@ -342,7 +342,7 @@ function ConvertTo-UsbInstanceId {
 function Get-UsbPrinterBindings {
     param([object[]]$Connectors)
     # PnP CDXML cmdlets emit their own verbose progress records in Windows PS5.
-    # Keep the scanner's single progress indicator; this preference is local.
+    # Also suppress progress locally; the main loop guards the global preference.
     $ProgressPreference='SilentlyContinue'
     $warnings=New-Object 'System.Collections.Generic.List[string]'
     $names=@{};$queues=@{};$queueRead=$false
@@ -428,6 +428,8 @@ function Get-UsbPortChanges {
     }
 }
 
+$savedUsbProgressPreference=$global:ProgressPreference
+$global:ProgressPreference='SilentlyContinue'
 try {
     if (-not ('ScriptonitePhysicalUsb.Reader' -as [type])) { Add-Type -TypeDefinition $nativeSource -Language CSharp }
     $Host.UI.RawUI.WindowTitle = 'Scriptonite — Физические USB-порты'
@@ -477,9 +479,8 @@ try {
         if ($rows.Count) { Write-Host ($rows | Format-Table -AutoSize -Wrap | Out-String -Width ([Math]::Max(60, $Host.UI.RawUI.WindowSize.Width - 1))) }
         else { Write-Host 'На подтверждённых внешних разъёмах устройств не обнаружено.' }
         Write-Host 'ПОРТЫ ПЕЧАТИ USB — СОПОСТАВЛЕНИЕ С РАЗЪЁМАМИ:' -ForegroundColor Cyan
-        Write-Progress -Id 34 -Activity 'Сопоставление USB-портов печати' -Status 'Читаю порты, очереди и идентификаторы устройств...' -PercentComplete -1
-        try{$bindings=Get-UsbPrinterBindings $connectors}
-        finally{Write-Progress -Id 34 -Activity 'Сопоставление USB-портов печати' -Completed}
+        Write-Host 'Сопоставляю порты печати и USB-устройства...' -ForegroundColor DarkGray
+        $bindings=Get-UsbPrinterBindings $connectors
         if($bindings.Rows.Count){
             $bindingRows=@($bindings.Rows | ForEach-Object {[pscustomobject]@{'Логический порт'=$_.LogicalPort;'Очереди печати'=$_.Queues;'Физический разъём'=$_.PhysicalPort;'VID:PID'=$_.VidPid;'Устройство'=$_.Device;'Состояние'=$_.State}})
             Write-Host ($bindingRows | Format-Table -Wrap | Out-String -Width ([Math]::Max(80,$Host.UI.RawUI.WindowSize.Width-1)))
@@ -507,4 +508,6 @@ try {
     Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
     if (-not $Once) { $null = Read-Host 'Нажмите Enter для выхода' }
     else { throw }
+} finally {
+    $global:ProgressPreference=$savedUsbProgressPreference
 }
