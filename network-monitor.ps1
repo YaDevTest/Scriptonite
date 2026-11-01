@@ -24,6 +24,49 @@ $baseline = $false
 $networkKey = ''
 $cycle = 0
 $pendingPings = @()
+$consoleGuard = $null
+
+function Start-NetworkConsoleGuard {
+    # Prevent accidental mouse selection from pausing the legacy Windows console.
+    try {
+        if (-not ('ScriptoniteNetwork.ConsoleInputGuard' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace ScriptoniteNetwork {
+    public sealed class ConsoleInputGuard : IDisposable {
+        readonly IntPtr input;
+        readonly uint previous;
+        bool changed;
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern IntPtr GetStdHandle(int standardHandle);
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern bool GetConsoleMode(IntPtr handle, out uint mode);
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern bool SetConsoleMode(IntPtr handle, uint mode);
+        public ConsoleInputGuard() {
+            input=GetStdHandle(-10);
+            uint mode;
+            if(input==IntPtr.Zero || input==new IntPtr(-1) || !GetConsoleMode(input,out mode)) return;
+            previous=mode;
+            uint running=(mode | 0x0080u) & ~0x0040u;
+            if(running!=mode) changed=SetConsoleMode(input,running);
+        }
+        public void Dispose() {
+            if(!changed) return;
+            // EXTENDED_FLAGS must be set while restoring the QuickEdit bit.
+            if(SetConsoleMode(input,previous | 0x0080u)) {
+                SetConsoleMode(input,previous);
+                changed=false;
+            }
+        }
+    }
+}
+'@ -Language CSharp
+        }
+        return New-Object ScriptoniteNetwork.ConsoleInputGuard
+    } catch { Write-Verbose ('Не удалось отключить быстрое выделение: '+$_.Exception.Message) }
+}
 
 function Add-Event([string]$Message, [string]$Color = 'Yellow') {
     $entry = [PSCustomObject]@{ Text = "$(Get-Date -Format 'HH:mm:ss') $Message"; Color = $Color }
@@ -101,6 +144,7 @@ function Show-Table($Rows, [string]$Color = 'White') {
 }
 
 try {
+    $consoleGuard = Start-NetworkConsoleGuard
     while ($true) {
         $script:live = $false
         $configs = @(Get-NetIPConfiguration | Where-Object { $_.IPv4Address })
@@ -279,6 +323,7 @@ try {
 } catch {
     Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
 } finally {
+    if ($consoleGuard) { $consoleGuard.Dispose() }
     foreach ($request in $pendingPings) { $request.Ping.Dispose() }
     if ($script:socket) { $script:socket.Close() }
 }

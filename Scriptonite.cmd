@@ -220,6 +220,7 @@ $catalog = [ordered]@{
     '2' = @{ Name = 'Монитор USB'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/usb-monitor.ps1' }
     '3' = @{ Name = 'Монитор принтеров'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/printer-monitor.ps1' }
     '4' = @{ Name = 'Сниффер принтера (USB / LAN)'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/printer-sniffer.ps1'; Report=$true }
+    '5' = @{ Name = 'Сниффер всей системы печати'; Uri = [uri]'https://raw.githubusercontent.com/YaDevTest/Scriptonite/main/print-system-sniffer.ps1'; Report=$true }
 }
 $cacheDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Scriptonite\scripts'
 $status = ''
@@ -237,13 +238,14 @@ while ($true) {
     $choice = ([string](Read-Host 'Выберите скрипт')).Trim()
     if ($choice -eq '0') { return }
     if (-not $catalog.Contains($choice)) {
-        $status = 'Введите 1 — сеть, 2 — USB, 3 — принтеры, 4 — сниффер или 0 — выход.'
+        $status = 'Введите 1 — сеть, 2 — USB, 3 — принтеры, 4 — сниффер принтера, 5 — вся система печати или 0 — выход.'
         continue
     }
     $selected = $catalog[$choice]
     try {
         Write-Host "Скачиваю с GitHub: $($selected.Name)..." -ForegroundColor Cyan
         $monitorPath = Save-ScriptoniteDownload -Uri $selected.Uri -CacheDirectory $cacheDirectory
+        Write-Host 'Скачивание завершено. Запускаю скрипт; подготовка данных будет показана в новом окне...' -ForegroundColor Cyan
         if($selected.Report){Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath -OutputDirectory $ReportDirectory}
         else{Start-ScriptoniteMonitor -ScriptPath $monitorPath -PowerShellPath $powerShellPath}
         $status = "$($selected.Name) запущен в отдельном окне. Меню готово к работе."

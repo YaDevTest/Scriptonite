@@ -132,15 +132,20 @@ function Get-PrinterTcpChecks {
 }
 
 function Get-PrinterSnapshot {
-    $printers = @(Get-Printer -Full -ErrorAction Stop | Sort-Object Name)
+    Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status 'Получаю список очередей Windows...' -PercentComplete -1
+    $printers = @(Get-Printer -ErrorAction Stop | Sort-Object Name)
     $wmi = @{}
-    try { Get-CimInstance -ClassName Win32_Printer -ErrorAction Stop | ForEach-Object { $wmi[$_.Name] = $_ } } catch {}
+    Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status 'Читаю состояние устройств Windows (WMI)...' -PercentComplete -1
+    try { Get-CimInstance -ClassName Win32_Printer -OperationTimeoutSec 10 -ErrorAction Stop | ForEach-Object { $wmi[$_.Name] = $_ } } catch {}
     $ports = @{}
+    Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status 'Читаю порты печати...' -PercentComplete -1
     try { Get-PrinterPort -ErrorAction Stop | ForEach-Object { $ports[$_.Name] = $_ } } catch {}
+    Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status 'Проверяю доступность сетевых портов...' -PercentComplete -1
     $tcpChecks = Get-PrinterTcpChecks $ports
     $presentIds = @{}
     $presenceAvailable = $false
     if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
+        Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status 'Определяю подключённые USB-устройства...' -PercentComplete -1
         try {
             Get-PnpDevice -PresentOnly -ErrorAction Stop | ForEach-Object { $presentIds[$_.InstanceId] = $true }
             $presenceAvailable = $true
@@ -149,6 +154,7 @@ function Get-PrinterSnapshot {
     $number = 0
     foreach ($printer in $printers) {
         $number++
+        Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Status ("Принтер $number из $($printers.Count): $($printer.Name) — устройство и очередь") -PercentComplete ([int](100*($number-1)/[Math]::Max(1,$printers.Count)))
         $wp = $wmi[$printer.Name]
         $state = Get-PrinterQueueState $printer $wp
         $hardware = Get-PrinterHardware $printer $wp $presentIds $presenceAvailable
@@ -611,6 +617,7 @@ function Write-PrinterTable {
 }
 
 try {
+    Write-Host 'Загрузка: подключаю модуль управления печатью Windows...' -ForegroundColor Cyan
     Import-Module PrintManagement -ErrorAction Stop
     $Host.UI.RawUI.WindowTitle = 'Scriptonite — Принтеры'
     $selectedName = ''
@@ -620,7 +627,11 @@ try {
         $cycle++
         Clear-Host
         Write-Host "ПРИНТЕРЫ | Проверка №$cycle | $(Get-Date)" -ForegroundColor Cyan
-        $printers = @(Get-PrinterSnapshot)
+        Write-Host 'Загрузка: получаю принтеры, порты, устройства и очереди. Текущий шаг показан в индикаторе...' -ForegroundColor Yellow
+        try { $printers = @(Get-PrinterSnapshot) }
+        finally { Write-Progress -Id 31 -Activity 'Загрузка данных принтеров' -Completed }
+        Clear-Host
+        Write-Host "ПРИНТЕРЫ | Проверка №$cycle | $(Get-Date)" -ForegroundColor Cyan
         if ($printers.Count) {
             Write-PrinterTable $printers
         } else { Write-Host 'Установленные принтеры не найдены.' -ForegroundColor Yellow }
